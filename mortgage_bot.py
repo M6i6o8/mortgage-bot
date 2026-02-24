@@ -1,40 +1,24 @@
 """
-Ипотечный бот - ПРОСТАЯ RSS-ВЕРСИЯ
-Использует публичные RSS-мосты для Telegram
+Ипотечный бот - ПРАВИЛЬНАЯ ВЕРСИЯ с telegram-pm
+Запуск на GitHub Actions с Python 3.12
 """
 
 import requests
-from bs4 import BeautifulSoup
 import re
 from datetime import datetime
 import os
-import time
+import sqlite3
+from telegram_pm.run import run_tpm  # ← ПРАВИЛЬНЫЙ ИМПОРТ!
 
 # ===== НАСТРОЙКИ =====
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 CHANNEL_ID = os.environ.get('CHANNEL_ID', '')
 
-# ===== RSS-МОСТЫ ДЛЯ TELEGRAM =====
-class TelegramRSSParser:
+# ===== ПАРСЕР TELEGRAM-КАНАЛОВ =====
+class TelegramParser:
     def __init__(self):
-        # Каналы и их RSS-ссылки (рабочие на 2026 год)
-        self.channels = {
-            'banki_ru': [
-                'https://rsshub.app/telegram/channel/banki_ru',
-                'https://tg.i-c-a.su/rss/banki_ru.xml',
-                'https://rss.bring10.com/telegram/channel/banki_ru'
-            ],
-            'ipoteka_rus': [
-                'https://rsshub.app/telegram/channel/ipoteka_rus',
-                'https://tg.i-c-a.su/rss/ipoteka_rus.xml',
-                'https://rss.bring10.com/telegram/channel/ipoteka_rus'
-            ],
-            'tbank_news': [
-                'https://rsshub.app/telegram/channel/tbank_news',
-                'https://tg.i-c-a.su/rss/tbank_news.xml',
-                'https://rss.bring10.com/telegram/channel/tbank_news'
-            ]
-        }
+        self.db_path = "telegram.db"
+        self.channels = ["banki_ru", "ipoteka_rus", "tbank_news"]
         
         # Паттерны банков
         self.bank_patterns = {
@@ -73,134 +57,123 @@ class TelegramRSSParser:
             'Транскапиталбанк': 20.25,
             'ВБРР': 20.4,
         }
-    
-    def fetch_rss(self, url):
-        """Загружает RSS-ленту"""
+        
+    def parse_channels(self):
+        """Парсит Telegram-каналы через telegram-pm"""
+        print("  📡 Парсим Telegram-каналы через telegram-pm...")
+        
         try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'
-            }
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                return response.text
-        except:
-            pass
-        return None
-    
-    def parse_rss_items(self, xml_content):
-        """Парсит RSS и возвращает список сообщений"""
-        try:
-            soup = BeautifulSoup(xml_content, 'xml')
-            items = []
+            # Запускаем telegram-pm с правильными параметрами [citation:1]
+            run_tpm(
+                db_path=self.db_path,
+                channels=self.channels,
+                verbose=False,
+                format="sqlite",
+                tg_iteration_in_preview_count=2,  # 2 итерации = ~40 сообщений
+                tg_sleep_time_seconds=1,
+                http_timeout=30,
+                http_headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                }
+            )
             
-            # Ищем item или entry
-            for item in soup.find_all(['item', 'entry']):
-                title = item.find('title')
-                description = item.find('description')
-                content = item.find('content') or item.find('content:encoded')
-                
-                text = ''
-                if title and title.text:
-                    text += title.text + ' '
-                if description and description.text:
-                    text += description.text + ' '
-                if content and content.text:
-                    text += content.text
-                
-                if text.strip():
-                    items.append(text.strip())
+            # Подключаемся к базе
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
             
-            return items[:20]  # Последние 20 сообщений
-        except:
-            return []
-    
-    def extract_rates_from_text(self, text, channel_name):
-        """Ищет в тексте ставки и банки"""
-        found = {}
-        
-        # Ищем все ставки в тексте
-        rate_matches = re.findall(r'(\d+[.,]\d+)%', text)
-        if not rate_matches:
-            return found
-        
-        # Берем первую ставку
-        rate = float(rate_matches[0].replace(',', '.'))
-        
-        # Проверяем каждый банк
-        for bank_name, pattern in self.bank_patterns.items():
-            if re.search(pattern, text, re.IGNORECASE):
-                if bank_name not in found or rate < found[bank_name]:
-                    found[bank_name] = rate
-                    print(f"      ✅ {bank_name}: {rate}% (из @{channel_name})")
-        
-        return found
-    
-    def parse_all_channels(self):
-        """Парсит все каналы через RSS"""
-        print("  📡 Парсим Telegram-каналы через RSS...")
-        
-        all_rates = {}
-        
-        for channel_name, urls in self.channels.items():
-            print(f"    📍 @{channel_name}:")
+            found_rates = {}
             
-            # Пробуем каждый URL для канала
-            for url in urls:
-                print(f"      Пробуем {url[:50]}...")
-                xml_content = self.fetch_rss(url)
-                
-                if xml_content:
-                    messages = self.parse_rss_items(xml_content)
-                    print(f"        Найдено сообщений: {len(messages)}")
+            # Для каждого канала проверяем сообщения
+            for channel in self.channels:
+                try:
+                    # Проверяем, есть ли таблица
+                    cursor.execute(f"""
+                        SELECT name FROM sqlite_master 
+                        WHERE type='table' AND name='{channel}'
+                    """)
                     
-                    # Ищем ставки в каждом сообщении
-                    for msg in messages:
-                        rates = self.extract_rates_from_text(msg, channel_name)
-                        for bank, rate in rates.items():
-                            if bank not in all_rates or rate < all_rates[bank]:
-                                all_rates[bank] = rate
+                    if not cursor.fetchone():
+                        continue
                     
-                    if messages:
-                        break  # Если нашли сообщения, другие URL не пробуем
-                else:
-                    print(f"        ❌ Не загрузился")
+                    # Получаем последние 50 сообщений [citation:1]
+                    cursor.execute(f"""
+                        SELECT text, date FROM "{channel}" 
+                        ORDER BY date DESC LIMIT 50
+                    """)
+                    
+                    messages = cursor.fetchall()
+                    print(f"      @{channel}: {len(messages)} сообщений")
+                    
+                    for text, date in messages:
+                        if not text:
+                            continue
+                        
+                        # Ищем ставку (число с %)
+                        rate_matches = re.findall(r'(\d+[.,]\d+)%', text)
+                        if not rate_matches:
+                            continue
+                        
+                        rate = float(rate_matches[0].replace(',', '.'))
+                        
+                        # Проверяем все паттерны банков
+                        for bank_name, pattern in self.bank_patterns.items():
+                            if re.search(pattern, text, re.IGNORECASE):
+                                if bank_name not in found_rates or rate < found_rates[bank_name]:
+                                    found_rates[bank_name] = rate
+                                    print(f"        ✅ {bank_name}: {rate}%")
+                                    
+                except Exception as e:
+                    print(f"      ⚠️ Ошибка @{channel}: {e}")
+                    continue
             
-            time.sleep(1)  # Пауза между каналами
-        
-        return all_rates
+            conn.close()
+            
+            # Удаляем базу после использования
+            try:
+                os.remove(self.db_path)
+            except:
+                pass
+            
+            return found_rates
+            
+        except Exception as e:
+            print(f"    ⚠️ Ошибка telegram-pm: {e}")
+            return {}
 
-# ===== ОСНОВНОЙ КЛАСС =====
-class MortgageBot:
+# ===== ОСНОВНОЙ ПАРСЕР =====
+class AutoParser:
     def __init__(self):
-        self.rss_parser = TelegramRSSParser()
-        self.rates = {}
+        self.telegram_parser = TelegramParser()
+        self.all_rates = {}
     
-    def collect_rates(self):
-        print("\n  🚀 ЗАПУСК СБОРА СТАВОК")
+    def collect_all_rates(self):
+        print("\n  🚀 ЗАПУСК АВТОМАТИЧЕСКОГО СБОРА")
         
-        # Парсим Telegram
-        telegram_rates = self.rss_parser.parse_all_channels()
+        # Парсим Telegram-каналы
+        telegram_rates = self.telegram_parser.parse_channels()
         
         # Добавляем найденные ставки
         for bank, rate in telegram_rates.items():
-            self.rates[bank] = rate
+            self.all_rates[bank] = rate
         
-        # Добавляем базовые ставки для остальных
-        for bank, rate in self.rss_parser.base_rates.items():
-            if bank not in self.rates:
-                self.rates[bank] = rate
+        # Добавляем базовые ставки для банков, которых нет
+        for bank, rate in self.telegram_parser.base_rates.items():
+            if bank not in self.all_rates:
+                self.all_rates[bank] = rate
                 print(f"    ➕ {bank}: {rate}% (базовая)")
         
-        print(f"\n  ✅ ВСЕГО БАНКОВ: {len(self.rates)}")
-        return self.rates
+        print(f"\n  ✅ ВСЕГО БАНКОВ: {len(self.all_rates)}")
+        return self.all_rates
 
 # ===== ФОРМАТИРОВАНИЕ =====
-def format_message(rates):
-    if not rates:
+def format_message(rates_dict):
+    if not rates_dict:
         return "😔 Не удалось получить ставки"
     
-    sorted_rates = sorted(rates.items(), key=lambda x: x[1])
-    min_bank, min_rate = sorted_rates[0]
+    rates_list = [(bank, rate) for bank, rate in rates_dict.items()]
+    rates_list.sort(key=lambda x: x[1])
+    
+    min_bank, min_rate = rates_list[0]
     
     text = f"""
 🏠 <b>Ипотека сегодня: МИНИМАЛЬНАЯ СТАВКА</b>
@@ -212,7 +185,7 @@ def format_message(rates):
 
 """
     
-    for i, (bank, rate) in enumerate(sorted_rates, 1):
+    for i, (bank, rate) in enumerate(rates_list, 1):
         if i == 1:
             text += f"🥇 {bank} — {rate}%\n"
         elif i == 2:
@@ -225,8 +198,8 @@ def format_message(rates):
     text += f"""
 
 📅 {datetime.now().strftime('%d.%m.%Y %H:%M')} (МСК)
-📊 Всего банков: {len(sorted_rates)}
-🔄 Источник: RSS-мосты Telegram
+📊 Всего банков: {len(rates_list)}
+🔄 Источник: Telegram-каналы (telegram-pm)
 """
     
     return text
@@ -252,7 +225,7 @@ def send_to_channel(text):
 # ===== ГЛАВНАЯ =====
 def main():
     print("=" * 60)
-    print("🚀 ИПОТЕЧНЫЙ БОТ - RSS-ВЕРСИЯ")
+    print("🚀 ИПОТЕЧНЫЙ БОТ - TELEGRAM-PM (ПРАВИЛЬНЫЙ)")
     print(f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
     print("=" * 60)
     
@@ -260,8 +233,8 @@ def main():
         print("❌ Ошибка: не заданы BOT_TOKEN или CHANNEL_ID")
         return
     
-    bot = MortgageBot()
-    rates = bot.collect_rates()
+    parser = AutoParser()
+    rates = parser.collect_all_rates()
     
     message = format_message(rates)
     send_to_channel(message)
