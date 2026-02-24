@@ -11,7 +11,8 @@ import os
 import random
 import time
 import warnings
-from proxy_rotator import ProxyRotator, ProxyTester
+from proxyrotation import ProxyRotator
+from proxyrotation.modelling import Anonymity
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -42,14 +43,14 @@ class BankiRuParser:
             'МТС Банк': 20.7,
         }
         
-        # Настраиваем ротатор прокси
+        # Инициализируем ротатор прокси [citation:4]
         self.rotator = ProxyRotator(
-            sources=['free'],  # Используем бесплатные источники
-            proxy_type=['http', 'https'],  # Только HTTP/HTTPS прокси
-            max_workers=10,  # Сколько прокси проверять одновременно
-            cache_ttl=300,  # Кешируем рабочие прокси на 5 минут
-            countries=['RU'],  # Прокси в России (быстрее)
-            timeout=5,  # Таймаут проверки прокси
+            anonymity=Anonymity.high,  # Только анонимные прокси
+            countrycodeset={"RU"},      # Россия (быстрее)
+            livecheck=True,              # Проверять что прокси живые
+            maxshape=50,                 # Максимум прокси в пуле
+            schedule=3600.0,              # Обновлять список каждый час
+            secure=True                   # Только HTTPS прокси
         )
         
         # Заголовки как у реального браузера
@@ -106,13 +107,8 @@ class BankiRuParser:
         try:
             print("  Парсим Банки.ру с прокси-револьвером...")
             
-            # Получаем рабочий прокси
-            proxy = self.rotator.get_proxy()
-            if not proxy:
-                print("    ⚠️ Не удалось получить рабочий прокси")
-                return False
-            
-            print(f"    Использую прокси: {proxy}")
+            # Получаем новый прокси [citation:4]
+            self.rotator.rotate()
             
             # Формируем заголовки
             headers = self.headers.copy()
@@ -121,18 +117,24 @@ class BankiRuParser:
             # Пробуем загрузить страницу
             url = "https://www.banki.ru/products/ipoteka/"
             
-            # Делаем запрос через прокси
+            # Делаем запрос через выбранный прокси
             session = requests.Session()
+            
+            # Настраиваем прокси для сессии
             session.proxies = {
-                'http': f'http://{proxy}',
-                'https': f'http://{proxy}'
+                'http': f'http://{self.rotator.selected}',
+                'https': f'http://{self.rotator.selected}'
             }
             
             # Сначала заходим на главную (получаем куки)
             main_headers = headers.copy()
             main_headers['Referer'] = 'https://www.google.com/'
-            session.get('https://www.banki.ru/', headers=main_headers, timeout=15)
-            time.sleep(2)
+            
+            try:
+                session.get('https://www.banki.ru/', headers=main_headers, timeout=15)
+                time.sleep(2)
+            except:
+                pass  # Если главная не грузится, пробуем сразу ипотеку
             
             # Теперь идём на страницу с ипотекой
             response = session.get(url, headers=headers, timeout=15)
@@ -175,22 +177,16 @@ class BankiRuParser:
                 
                 if found_banks > 0:
                     print(f"    ✅ Найдено банков: {found_banks}")
-                    # Сообщаем ротатору, что прокси хороший
-                    self.rotator.report_success(proxy)
                     return True
                 else:
                     print(f"    ⚠️ Банки не найдены, структура могла измениться")
-                    self.rotator.report_failure(proxy)
                     return False
             else:
                 print(f"    ⚠️ Статус {response.status_code}")
-                self.rotator.report_failure(proxy)
                 return False
                 
         except Exception as e:
             print(f"    ✗ Ошибка парсинга: {e}")
-            if 'proxy' in locals():
-                self.rotator.report_failure(proxy)
             return False
     
     def parse_individual_banks(self):
@@ -310,14 +306,11 @@ def format_message(rates_dict):
         else:
             text += f"• {bank} — {rate}%\n"
     
-    # Добавляем информацию об источнике
-    source_info = "с прокси" if len(rates_list) > 10 else "комбинированные"
-    
     text += f"""
 
 📅 Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')} (МСК)
 📊 Всего банков: {len(rates_list)}
-🔄 Источник: {source_info}
+🔄 Прокси-револьвер: активен
 """
     
     return text
