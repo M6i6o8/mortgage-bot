@@ -1,5 +1,5 @@
 """
-Ипотечный бот - ПРАВИЛЬНАЯ ВЕРСИЯ с telegram-pm
+Ипотечный бот - РАСШИРЕННАЯ ВЕРСИЯ с SOCKS5 прокси
 Запуск на GitHub Actions с Python 3.12
 """
 
@@ -8,17 +8,86 @@ import re
 from datetime import datetime
 import os
 import sqlite3
-from telegram_pm.run import run_tpm  # ← ПРАВИЛЬНЫЙ ИМПОРТ!
+import random
+from telegram_pm.run import run_tpm
 
 # ===== НАСТРОЙКИ =====
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 CHANNEL_ID = os.environ.get('CHANNEL_ID', '')
 
+# ===== ПРОКСИ-МЕНЕДЖЕР =====
+class ProxyManager:
+    def __init__(self):
+        self.socks_proxies = []
+        self.load_proxies()
+    
+    def load_proxies(self):
+        """Загружает свежие SOCKS5 прокси"""
+        try:
+            # Источники SOCKS5 прокси
+            sources = [
+                "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+                "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+                "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
+                "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+                "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all"
+            ]
+            
+            all_proxies = []
+            for url in sources:
+                try:
+                    response = requests.get(url, timeout=5)
+                    if response.status_code == 200:
+                        proxies = response.text.strip().split('\n')
+                        all_proxies.extend([p.strip() for p in proxies if p.strip()])
+                except:
+                    continue
+            
+            # Убираем дубликаты и оставляем только валидные
+            self.socks_proxies = list(set(all_proxies))[:50]
+            print(f"    ✅ Загружено SOCKS5 прокси: {len(self.socks_proxies)}")
+            
+        except Exception as e:
+            print(f"    ⚠️ Ошибка загрузки прокси: {e}")
+            self.socks_proxies = []
+    
+    def get_random_proxy(self):
+        """Возвращает случайный SOCKS5 прокси"""
+        if not self.socks_proxies:
+            self.load_proxies()
+        
+        if self.socks_proxies:
+            proxy = random.choice(self.socks_proxies)
+            return {
+                'http': f'socks5://{proxy}',
+                'https': f'socks5://{proxy}'
+            }
+        return None
+
 # ===== ПАРСЕР TELEGRAM-КАНАЛОВ =====
 class TelegramParser:
     def __init__(self):
         self.db_path = "telegram.db"
-        self.channels = ["banki_ru", "ipoteka_rus", "tbank_news"]
+        # Расширенный список каналов (banki_ru убран)
+        self.channels = [
+            "ipoteka_rus",        # новости ипотеки
+            "tbank_news",          # Т-Банк
+            "ipoteka_stavka",      # ставки по ипотеке
+            "sberbank_news",       # новости Сбера
+            "vtb_news",            # новости ВТБ
+            "alfabank",            # Альфа-Банк
+            "gazprombank",         # Газпромбанк
+            "domrfbank",           # Дом.РФ
+            "ipoteka_segodnya",    # ипотека сегодня
+            "russian_realty",      # недвижимость РФ
+            "ipoteka_2026",        # ипотека в 2026
+            "realty_news",         # новости недвижимости
+            "banki_today",         # банки сегодня
+            "finansist",           # финансы
+            "ekonomika_ru",        # экономика РФ
+        ]
+        
+        self.proxy_manager = ProxyManager()
         
         # Паттерны банков
         self.bank_patterns = {
@@ -59,21 +128,29 @@ class TelegramParser:
         }
         
     def parse_channels(self):
-        """Парсит Telegram-каналы через telegram-pm"""
-        print("  📡 Парсим Telegram-каналы через telegram-pm...")
+        """Парсит Telegram-каналы через telegram-pm с SOCKS5 прокси"""
+        print("  📡 Парсим Telegram-каналы с SOCKS5 прокси...")
+        
+        # Получаем случайный прокси
+        proxy = self.proxy_manager.get_random_proxy()
+        if proxy:
+            print(f"    Используем прокси: {proxy['http']}")
         
         try:
-            # Запускаем telegram-pm с правильными параметрами [citation:1]
+            # Запускаем telegram-pm с прокси
             run_tpm(
                 db_path=self.db_path,
                 channels=self.channels,
-                verbose=False,
+                verbose=True,
                 format="sqlite",
-                tg_iteration_in_preview_count=2,  # 2 итерации = ~40 сообщений
-                tg_sleep_time_seconds=1,
-                http_timeout=30,
+                tg_iteration_in_preview_count=1,  # 1 итерация = ~20 сообщений
+                tg_sleep_time_seconds=2,
+                http_timeout=45,
+                proxy=proxy,  # Добавляем SOCKS5 прокси
                 http_headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                 }
             )
             
@@ -83,36 +160,34 @@ class TelegramParser:
             
             found_rates = {}
             
-            # Для каждого канала проверяем сообщения
-            for channel in self.channels:
+            # Получаем список всех таблиц
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = cursor.fetchall()
+            
+            for table in tables:
+                table_name = table[0]
+                print(f"    📍 Канал @{table_name}:")
+                
                 try:
-                    # Проверяем, есть ли таблица
+                    # Получаем последние 30 сообщений
                     cursor.execute(f"""
-                        SELECT name FROM sqlite_master 
-                        WHERE type='table' AND name='{channel}'
-                    """)
-                    
-                    if not cursor.fetchone():
-                        continue
-                    
-                    # Получаем последние 50 сообщений [citation:1]
-                    cursor.execute(f"""
-                        SELECT text, date FROM "{channel}" 
-                        ORDER BY date DESC LIMIT 50
+                        SELECT text, date FROM "{table_name}" 
+                        ORDER BY date DESC LIMIT 30
                     """)
                     
                     messages = cursor.fetchall()
-                    print(f"      @{channel}: {len(messages)} сообщений")
+                    print(f"      Сообщений: {len(messages)}")
                     
                     for text, date in messages:
                         if not text:
                             continue
                         
-                        # Ищем ставку (число с %)
+                        # Ищем все ставки в тексте
                         rate_matches = re.findall(r'(\d+[.,]\d+)%', text)
                         if not rate_matches:
                             continue
                         
+                        # Берем первую найденную ставку
                         rate = float(rate_matches[0].replace(',', '.'))
                         
                         # Проверяем все паттерны банков
@@ -123,7 +198,7 @@ class TelegramParser:
                                     print(f"        ✅ {bank_name}: {rate}%")
                                     
                 except Exception as e:
-                    print(f"      ⚠️ Ошибка @{channel}: {e}")
+                    print(f"      ⚠️ Ошибка: {e}")
                     continue
             
             conn.close()
@@ -155,6 +230,7 @@ class AutoParser:
         # Добавляем найденные ставки
         for bank, rate in telegram_rates.items():
             self.all_rates[bank] = rate
+            print(f"    🔥 {bank}: {rate}% (из Telegram)")
         
         # Добавляем базовые ставки для банков, которых нет
         for bank, rate in self.telegram_parser.base_rates.items():
@@ -199,7 +275,7 @@ def format_message(rates_dict):
 
 📅 {datetime.now().strftime('%d.%m.%Y %H:%M')} (МСК)
 📊 Всего банков: {len(rates_list)}
-🔄 Источник: Telegram-каналы (telegram-pm)
+🔄 Источник: Telegram-каналы + SOCKS5 прокси
 """
     
     return text
@@ -225,7 +301,7 @@ def send_to_channel(text):
 # ===== ГЛАВНАЯ =====
 def main():
     print("=" * 60)
-    print("🚀 ИПОТЕЧНЫЙ БОТ - TELEGRAM-PM (ПРАВИЛЬНЫЙ)")
+    print("🚀 ИПОТЕЧНЫЙ БОТ - PROXY + 15 КАНАЛОВ")
     print(f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
     print("=" * 60)
     
