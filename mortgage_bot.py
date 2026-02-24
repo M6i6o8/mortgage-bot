@@ -1,11 +1,12 @@
 """
-Ипотечный бот - ФИНАЛЬНАЯ ВЕРСИЯ С ФИЛЬТРАЦИЕЙ
-Отсеивает мусорные ставки, парсит только реальные
+Ипотечный бот - АВТОМАТИЧЕСКИЙ СБОРНИК МИНИМАЛЬНЫХ СТАВОК
+Никакого ручного обновления, всё само накапливается
 Запуск на GitHub Actions
 """
 
 import os
 import re
+import json
 import asyncio
 import requests
 from datetime import datetime
@@ -19,20 +20,21 @@ CHANNEL_ID = os.environ.get('CHANNEL_ID', '')
 API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
 
-# Каналы для парсинга (только существующие и полезные)
+# Файл для хранения истории ставок
+HISTORY_FILE = 'rates_history.json'
+
+# Каналы для парсинга (только существующие)
 TARGET_CHANNELS = [
     'tbank_news',           # Т-Банк
     'alfabank',             # Альфа-Банк
     'gazprombank',          # Газпромбанк
     'ipoteka_stavka',       # Ставки по ипотеке
     'ipoteka_rus',          # Ипотека в России
-    'ipoteka_segodnya',     # Ипотека сегодня
-    'sberbank_news',        # Сбер (проверим, может работает)
-    'vtb_news',             # ВТБ (проверим)
+    'ipoteka_segodnya',     # Ипотека сегодня (✅ золотой канал!)
 ]
 
-# Базовые ставки (проверенные вручную)
-BASE_RATES = {
+# Начальные базовые ставки (только для первого запуска)
+INITIAL_RATES = {
     'Сбербанк': 21.0,
     'ВТБ': 20.1,
     'Альфа-Банк': 20.5,
@@ -50,12 +52,12 @@ BASE_RATES = {
     'ВБРР': 20.4,
 }
 
-# Паттерны для определения банков (расширенные)
+# Паттерны для определения банков
 BANK_PATTERNS = {
     'Сбербанк': r'сбер[банк]*|sber|сбербанк',
     'ВТБ': r'втб|vtb|втб банк',
     'Альфа-Банк': r'альфа|alfa|альфа-банк',
-    'Т-Банк': r'т[- ]?банк|тинькофф|tbank|tinkoff|тиньков',
+    'Т-Банк': r'т[- ]?банк|тинькофф|tbank|tinkoff',
     'Газпромбанк': r'газпром|gazprombank|газпромбанк',
     'Россельхозбанк': r'россельхоз|рсхб|rshb|сельхозбанк',
     'Промсвязьбанк': r'промсвязь|псб|psb|промсвязьбанк',
@@ -69,31 +71,75 @@ BANK_PATTERNS = {
     'ВБРР': r'вбрр|vbrr',
 }
 
+class RateHistory:
+    """Класс для работы с историей ставок"""
+    
+    def __init__(self):
+        self.history = self.load()
+    
+    def load(self):
+        """Загружает историю из файла"""
+        if os.path.exists(HISTORY_FILE):
+            try:
+                with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+    
+    def save(self):
+        """Сохраняет историю в файл"""
+        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self.history, f, indent=2, ensure_ascii=False)
+    
+    def update(self, bank, rate):
+        """Обновляет ставку для банка, если она ниже"""
+        bank_key = bank.strip()
+        current = self.history.get(bank_key)
+        
+        if current is None or rate < current:
+            self.history[bank_key] = rate
+            return True
+        return False
+    
+    def get_final_rates(self):
+        """Возвращает финальные ставки (история + начальные для отсутствующих)"""
+        final = {}
+        
+        # Сначала добавляем все из истории
+        for bank, rate in self.history.items():
+            final[bank] = rate
+        
+        # Добавляем начальные для банков, которых нет в истории
+        for bank, rate in INITIAL_RATES.items():
+            if bank not in final:
+                final[bank] = rate
+                print(f"    📊 Начальная ставка для {bank}: {rate}%")
+        
+        return final
+
 class TelegramParser:
     def __init__(self):
         self.client = TelegramClient('mortgage_bot_session', API_ID, API_HASH)
-        self.found_rates = {}
-        self.real_rates = {}  # Только отфильтрованные ставки
+        self.rate_history = RateHistory()
+        self.new_finds = 0
     
     def extract_rate(self, text):
-        """Извлекает ставку из текста с жёсткой фильтрацией"""
+        """Извлекает ставку из текста с фильтрацией"""
         if not text:
             return None
         
-        # Ищем все возможные ставки в тексте
         rate_matches = re.findall(r'(\d+[.,]\d+)%', text)
         if not rate_matches:
             return None
         
-        # Берём первую ставку
         try:
             rate = float(rate_matches[0].replace(',', '.'))
             
-            # Жёсткая фильтрация: только реалистичные рыночные ставки
+            # Фильтруем только реалистичные рыночные ставки
             if 10 <= rate <= 30:
                 return rate
             else:
-                # Логируем отброшенные ставки для отладки
                 if rate < 10:
                     print(f"          🟡 Отброшено (слишком низкая): {rate}%")
                 elif rate > 30:
@@ -134,7 +180,7 @@ class TelegramParser:
             # Получаем сущность канала
             entity = await self.client.get_entity(channel_username)
             
-            # Получаем последние 50 сообщений (увеличил для лучшего поиска)
+            # Получаем последние 50 сообщений
             messages = await self.client.get_messages(entity, limit=50)
             
             channel_found = 0
@@ -153,14 +199,15 @@ class TelegramParser:
                 if not bank:
                     continue
                 
-                # Сохраняем, если ставка ниже текущей
-                if bank not in self.real_rates or rate < self.real_rates[bank]:
-                    self.real_rates[bank] = rate
-                    channel_found += 1
-                    print(f"        ✅ {bank}: {rate}% (реальная)")
+                # Обновляем историю
+                if self.rate_history.update(bank, rate):
+                    self.new_finds += 1
+                    print(f"        ✅ НОВАЯ МИНИМАЛЬНАЯ СТАВКА! {bank}: {rate}%")
+                else:
+                    print(f"        ℹ️ {bank}: {rate}% (выше текущей)")
             
             if channel_found == 0:
-                print(f"        ⚠️ Реальных ставок не найдено")
+                print(f"        ⚠️ Новых ставок не найдено")
                 
         except Exception as e:
             error_msg = str(e)
@@ -180,39 +227,36 @@ class TelegramParser:
             # Проверяем, авторизованы ли мы
             if not await self.client.is_user_authorized():
                 print("    ❌ Ошибка: нет авторизации. Файл сессии не работает")
-                return {}
+                return
             else:
                 print("    ✅ Уже авторизованы (через файл сессии)")
             
-            print(f"  🔍 Начинаем парсинг {len(TARGET_CHANNELS)} каналов...")
+            print(f"\n  🔍 Начинаем парсинг {len(TARGET_CHANNELS)} каналов...")
+            print(f"  📊 Текущая история: {len(self.rate_history.history)} банков")
             
             # Парсим каждый канал
             for channel in TARGET_CHANNELS:
                 await self.parse_channel(channel)
-                await asyncio.sleep(1.5)  # Пауза между каналами
+                await asyncio.sleep(1.5)
+            
+            # Сохраняем обновлённую историю
+            self.rate_history.save()
+            
+            print(f"\n  📊 Найдено новых минимальных ставок: {self.new_finds}")
+            print(f"  📊 Всего в истории: {len(self.rate_history.history)} банков")
             
             # Отключаемся
             await self.client.disconnect()
             
-            print(f"\n  📊 Найдено реальных ставок: {len(self.real_rates)}")
-            return self.real_rates
-            
         except Exception as e:
             print(f"    ❌ Критическая ошибка: {e}")
-            return {}
 
-def format_message(found_rates):
-    """Форматирует сообщение для канала"""
-    # Объединяем найденные ставки с базовыми
-    all_rates = BASE_RATES.copy()
-    
-    # Обновляем найденными реальными ставками
-    for bank, rate in found_rates.items():
-        all_rates[bank] = rate
-        print(f"    🔥 Обновлено из Telegram: {bank} = {rate}%")
+def format_message(rate_history):
+    """Формирует сообщение для канала"""
+    final_rates = rate_history.get_final_rates()
     
     # Сортируем по ставке
-    rates_list = [(bank, rate) for bank, rate in all_rates.items()]
+    rates_list = [(bank, rate) for bank, rate in final_rates.items()]
     rates_list.sort(key=lambda x: x[1])
     
     min_bank, min_rate = rates_list[0]
@@ -239,14 +283,14 @@ def format_message(found_rates):
             text += f"• {bank} — {rate}%\n"
     
     # Добавляем статистику
-    telegram_count = len(found_rates)
-    source_text = "Telethon API (реальные ставки)" if telegram_count > 0 else "базовые данные"
+    history_count = len(rate_history.history)
+    source_text = f"история ({history_count} банков)" if history_count > 0 else "начальные данные"
     
     text += f"""
 
 📅 {datetime.now().strftime('%d.%m.%Y %H:%M')} (МСК)
 📊 Всего банков: {len(rates_list)}
-🤖 Найдено в Telegram: {telegram_count}
+🤖 В истории: {history_count}
 🔄 Источник: {source_text}
 """
     
@@ -275,7 +319,7 @@ def send_to_channel(text):
 
 def main():
     print("=" * 60)
-    print("🚀 ИПОТЕЧНЫЙ БОТ - ФИНАЛ С ФИЛЬТРАЦИЕЙ")
+    print("🚀 ИПОТЕЧНЫЙ БОТ - АВТОМАТИЧЕСКИЙ СБОРНИК")
     print(f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
     print("=" * 60)
     
@@ -289,8 +333,6 @@ def main():
         return
     
     print(f"📢 Канал: {CHANNEL_ID}")
-    print(f"📊 Базовых банков: {len(BASE_RATES)}")
-    print(f"📡 Каналов для парсинга: {len(TARGET_CHANNELS)}")
     
     # Создаём и запускаем парсер
     parser = TelegramParser()
@@ -300,10 +342,10 @@ def main():
     asyncio.set_event_loop(loop)
     
     try:
-        found_rates = loop.run_until_complete(parser.run())
+        loop.run_until_complete(parser.run())
         
         # Формируем и отправляем сообщение
-        message = format_message(found_rates)
+        message = format_message(parser.rate_history)
         send_to_channel(message)
         
         print("\n✅ ГОТОВО")
