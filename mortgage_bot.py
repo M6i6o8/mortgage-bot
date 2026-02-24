@@ -1,94 +1,27 @@
 """
-Ипотечный бот - ПОЛНЫЙ АВТОПИЛОТ с RSS-парсингом Telegram-каналов
-Запуск на GitHub Actions
+Ипотечный бот - ПОЛНЫЙ АВТОПИЛОТ с telegram-pm
+Запуск на GitHub Actions с Python 3.12
 """
 
 import requests
-from bs4 import BeautifulSoup
 import re
 from datetime import datetime
 import os
-import random
-import time
-import warnings
-
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+import sqlite3
+from telegram_pm.run import run_tpm
 
 # ===== НАСТРОЙКИ =====
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 CHANNEL_ID = os.environ.get('CHANNEL_ID', '')
 
-# ===== ПАРСЕР TELEGRAM-КАНАЛОВ ЧЕРЕЗ RSS =====
-class TelegramRSSParser:
+# ===== ПАРСЕР TELEGRAM-КАНАЛОВ =====
+class TelegramParser:
     def __init__(self):
-        self.channels = {
-            'banki_ru': 'https://rsshub.app/telegram/channel/banki_ru',
-            'ipoteka_rus': 'https://rsshub.app/telegram/channel/ipoteka_rus',
-            'tbank_news': 'https://rsshub.app/telegram/channel/tbank_news'
-        }
-        
-        # Резервные RSS-мосты
-        self.backup_bridges = [
-            'https://rss-bridge.org/bridge01/?action=display&bridge=TelegramBridge&channel=',
-            'https://tg.i-c-a.su/rss/',
-            'https://rss.telegram.org/'
-        ]
-    
-    def get_random_headers(self):
-        """Заголовки для запроса"""
-        return {
-            'User-Agent': random.choice([
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15',
-            ])
-        }
-    
-    def parse_channel_rss(self, channel_name, url):
-        """Парсит RSS-ленту канала"""
-        try:
-            headers = self.get_random_headers()
-            response = requests.get(url, headers=headers, timeout=10)
-            
-            if response.status_code != 200:
-                return []
-            
-            soup = BeautifulSoup(response.text, 'xml')
-            items = soup.find_all('item') or soup.find_all('entry')
-            
-            messages = []
-            for item in items[:15]:  # Последние 15 сообщений
-                title = item.find('title')
-                description = item.find('description')
-                pub_date = item.find('pubDate') or item.find('published')
-                
-                text = ''
-                if title and title.text:
-                    text += title.text + ' '
-                if description and description.text:
-                    text += description.text
-                
-                if text.strip():
-                    messages.append({
-                        'text': text,
-                        'date': pub_date.text if pub_date else '',
-                        'channel': channel_name
-                    })
-            
-            return messages
-            
-        except Exception as e:
-            print(f"    ⚠️ Ошибка RSS {channel_name}: {e}")
-            return []
-    
-    def parse_all_channels(self):
-        """Парсит все каналы и ищет ставки"""
-        print("  📡 Парсим Telegram-каналы через RSS...")
-        
-        all_messages = []
-        bank_rates = {}
+        self.db_path = "telegram.db"
+        self.channels = ["banki_ru", "ipoteka_rus", "tbank_news"]
         
         # Словарь банков и их паттернов
-        bank_patterns = {
+        self.bank_patterns = {
             'Сбербанк': r'сбер[банк]*|sber',
             'ВТБ': r'втб|vtb',
             'Альфа-Банк': r'альфа|alfa',
@@ -105,38 +38,6 @@ class TelegramRSSParser:
             'Транскапиталбанк': r'транскапитал|tcb',
             'ВБРР': r'вбрр|vbrr',
         }
-        
-        # Парсим каждый канал
-        for channel_name, url in self.channels.items():
-            messages = self.parse_channel_rss(channel_name, url)
-            all_messages.extend(messages)
-            print(f"    📍 @{channel_name}: {len(messages)} сообщений")
-        
-        # Ищем ставки в сообщениях
-        for msg in all_messages:
-            text = msg['text'].lower()
-            
-            # Ищем ставку (число с %)
-            rate_matches = re.findall(r'(\d+[.,]\d+)%', msg['text'])
-            if not rate_matches:
-                continue
-            
-            rate = float(rate_matches[0].replace(',', '.'))
-            
-            # Проверяем, какой банк упомянут
-            for bank_name, pattern in bank_patterns.items():
-                if re.search(pattern, text, re.IGNORECASE):
-                    if bank_name not in bank_rates or rate < bank_rates[bank_name]:
-                        bank_rates[bank_name] = rate
-                        print(f"      ✅ {bank_name}: {rate}% (из @{msg['channel']})")
-        
-        return bank_rates
-
-# ===== ОСНОВНОЙ ПАРСЕР =====
-class AutoParser:
-    def __init__(self):
-        self.all_rates = {}
-        self.telegram_parser = TelegramRSSParser()
         
         # Базовые ставки (на случай если ничего не спарсится)
         self.base_rates = {
@@ -156,20 +57,99 @@ class AutoParser:
             'Транскапиталбанк': 20.25,
             'ВБРР': 20.4,
         }
+        
+    def parse_channels(self):
+        """Парсит Telegram-каналы через telegram-pm"""
+        print("  📡 Парсим Telegram-каналы через telegram-pm...")
+        
+        try:
+            # Запускаем telegram-pm
+            run_tpm(
+                channels=self.channels,
+                db_path=self.db_path,
+                tg_iteration_in_preview_count=2,  # ~40 сообщений с канала
+                verbose=False
+            )
+            
+            # Подключаемся к базе
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            found_rates = {}
+            
+            # Для каждого канала проверяем сообщения
+            for channel in self.channels:
+                try:
+                    # Проверяем, есть ли таблица
+                    cursor.execute(f"""
+                        SELECT name FROM sqlite_master 
+                        WHERE type='table' AND name='{channel}'
+                    """)
+                    
+                    if not cursor.fetchone():
+                        continue
+                    
+                    # Получаем последние 30 сообщений
+                    cursor.execute(f"""
+                        SELECT text, date FROM "{channel}" 
+                        ORDER BY date DESC LIMIT 30
+                    """)
+                    
+                    messages = cursor.fetchall()
+                    
+                    for text, date in messages:
+                        if not text:
+                            continue
+                        
+                        # Ищем ставку (число с %)
+                        rate_matches = re.findall(r'(\d+[.,]\d+)%', text)
+                        if not rate_matches:
+                            continue
+                        
+                        rate = float(rate_matches[0].replace(',', '.'))
+                        
+                        # Проверяем все паттерны банков
+                        for bank_name, pattern in self.bank_patterns.items():
+                            if re.search(pattern, text, re.IGNORECASE):
+                                if bank_name not in found_rates or rate < found_rates[bank_name]:
+                                    found_rates[bank_name] = rate
+                                    print(f"      ✅ {bank_name}: {rate}% (из @{channel})")
+                                    
+                except Exception as e:
+                    continue
+            
+            conn.close()
+            
+            # Удаляем базу после использования
+            try:
+                os.remove(self.db_path)
+            except:
+                pass
+            
+            return found_rates
+            
+        except Exception as e:
+            print(f"    ⚠️ Ошибка telegram-pm: {e}")
+            return {}
+
+# ===== ОСНОВНОЙ ПАРСЕР =====
+class AutoParser:
+    def __init__(self):
+        self.telegram_parser = TelegramParser()
+        self.all_rates = {}
     
-    # ===== ГЛАВНЫЙ СБОР =====
     def collect_all_rates(self):
         print("\n  🚀 ЗАПУСК АВТОМАТИЧЕСКОГО СБОРА")
         
-        # Парсим Telegram-каналы через RSS
-        telegram_rates = self.telegram_parser.parse_all_channels()
+        # Парсим Telegram-каналы
+        telegram_rates = self.telegram_parser.parse_channels()
         
         # Добавляем найденные ставки
         for bank, rate in telegram_rates.items():
             self.all_rates[bank] = rate
         
         # Добавляем базовые ставки для банков, которых нет
-        for bank, rate in self.base_rates.items():
+        for bank, rate in self.telegram_parser.base_rates.items():
             if bank not in self.all_rates:
                 self.all_rates[bank] = rate
                 print(f"    ➕ {bank}: {rate}% (базовая)")
@@ -177,7 +157,7 @@ class AutoParser:
         print(f"\n  ✅ ВСЕГО БАНКОВ: {len(self.all_rates)}")
         return self.all_rates
 
-# ===== ФОРМАТИРОВАНИЕ СООБЩЕНИЯ =====
+# ===== ФОРМАТИРОВАНИЕ =====
 def format_message(rates_dict):
     if not rates_dict:
         return "😔 Не удалось получить ставки"
@@ -211,12 +191,12 @@ def format_message(rates_dict):
 
 📅 {datetime.now().strftime('%d.%m.%Y %H:%M')} (МСК)
 📊 Всего банков: {len(rates_list)}
-🔄 Источник: Telegram-каналы + база
+🔄 Источник: Telegram-каналы (telegram-pm)
 """
     
     return text
 
-# ===== ОТПРАВКА В КАНАЛ =====
+# ===== ОТПРАВКА =====
 def send_to_channel(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = {
@@ -237,7 +217,7 @@ def send_to_channel(text):
 # ===== ГЛАВНАЯ =====
 def main():
     print("=" * 60)
-    print("🚀 ИПОТЕЧНЫЙ БОТ - АВТОПИЛОТ (RSS)")
+    print("🚀 ИПОТЕЧНЫЙ БОТ - TELEGRAM-PM ВЕРСИЯ")
     print(f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
     print("=" * 60)
     
