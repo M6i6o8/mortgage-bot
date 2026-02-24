@@ -26,5 +26,5 @@ jobs:
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
         run: python mortgage_bot.py
