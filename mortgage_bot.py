@@ -1,5 +1,5 @@
 """
-Ипотечный бот - умный парсинг с автоматической ротацией прокси
+Ипотечный бот - умный парсинг с самодельным прокси-менеджером
 Запуск на GitHub Actions
 """
 
@@ -11,7 +11,6 @@ import os
 import random
 import time
 import warnings
-from litproxy import use_proxy, get_proxy_dict
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -19,10 +18,63 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 CHANNEL_ID = os.environ.get('CHANNEL_ID', '')
 
+# ===== СВОЙ ПРОКСИ-МЕНЕДЖЕР =====
+class SimpleProxyManager:
+    def __init__(self):
+        self.proxies = []
+        self.current_proxy = None
+        self.update_proxy_list()
+    
+    def update_proxy_list(self):
+        """Качает свежий список бесплатных прокси"""
+        try:
+            # Публичный API бесплатных прокси (работает без ключей)
+            url = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=RU&ssl=all&anonymity=all"
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                # Разбираем построчно
+                proxy_lines = response.text.strip().split('\n')
+                # Берём только российские, которые работают быстро
+                self.proxies = [p.strip() for p in proxy_lines if p.strip()][:50]
+                print(f"    ✅ Загружено прокси: {len(self.proxies)}")
+            else:
+                print(f"    ⚠️ Не удалось загрузить прокси, статус: {response.status_code}")
+                # Запасные прокси (на всякий случай)
+                self.proxies = [
+                    "185.132.179.146:8080",
+                    "45.132.184.38:3128",
+                    "46.229.234.113:8080"
+                ]
+        except Exception as e:
+            print(f"    ⚠️ Ошибка загрузки прокси: {e}")
+            self.proxies = []
+    
+    def get_random_proxy(self):
+        """Возвращает случайный прокси из списка"""
+        if not self.proxies:
+            self.update_proxy_list()
+        
+        if self.proxies:
+            self.current_proxy = random.choice(self.proxies)
+            return {
+                'http': f'http://{self.current_proxy}',
+                'https': f'http://{self.current_proxy}'
+            }
+        return None
+    
+    def report_failure(self):
+        """Сообщаем, что текущий прокси не работает - заменяем"""
+        if self.current_proxy and self.current_proxy in self.proxies:
+            self.proxies.remove(self.current_proxy)
+        self.current_proxy = None
+
 # ===== ПАРСЕР =====
 class BankiRuParser:
     def __init__(self):
         self.all_rates = {}
+        self.proxy_manager = SimpleProxyManager()
+        
         # Запасные ставки на случай если всё упадёт
         self.fallback_rates = {
             'Сбербанк': 21.0,
@@ -46,10 +98,8 @@ class BankiRuParser:
         self.headers = {
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
             'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
-            'Cache-Control': 'max-age=0',
         }
     
     def get_random_user_agent(self):
@@ -57,9 +107,7 @@ class BankiRuParser:
         ua_list = [
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         ]
         return random.choice(ua_list)
     
@@ -70,7 +118,6 @@ class BankiRuParser:
         
         patterns = [
             r'от\s*(\d+[.,]\d+)%',
-            r'ставка[^\d]*(\d+[.,]\d+)%',
             r'(\d+[.,]\d+)%\s*годовых',
             r'(\d+[.,]\d+)%',
         ]
@@ -92,65 +139,80 @@ class BankiRuParser:
         try:
             print("  Парсим Банки.ру с прокси...")
             
-            # Получаем прокси и делаем запрос через контекстный менеджер
-            with use_proxy():
+            # Пробуем до 3 разных прокси
+            for attempt in range(3):
+                # Получаем случайный прокси
+                proxy = self.proxy_manager.get_random_proxy()
+                if not proxy:
+                    print("    ⚠️ Нет доступных прокси")
+                    return False
+                
+                print(f"    Попытка {attempt+1}, прокси: {proxy['http']}")
+                
                 headers = self.headers.copy()
                 headers['User-Agent'] = self.get_random_user_agent()
                 
-                # Сначала заходим на главную (получаем куки)
-                session = requests.Session()
-                session.headers.update(headers)
-                
-                # Пробуем загрузить главную страницу
-                session.get('https://www.banki.ru/', timeout=15)
-                time.sleep(2)
-                
-                # Теперь идём на страницу с ипотекой
-                url = "https://www.banki.ru/products/ipoteka/"
-                response = session.get(url, timeout=15)
-                
-                if response.status_code == 200:
-                    soup = BeautifulSoup(response.text, 'html.parser')
+                try:
+                    # Делаем запрос через прокси
+                    session = requests.Session()
+                    session.proxies.update(proxy)
+                    session.headers.update(headers)
                     
-                    # Ищем строки с банками
-                    found_banks = 0
-                    rows = soup.find_all('tr', {'data-test': 'row'})
+                    # Сначала заходим на главную
+                    session.get('https://www.banki.ru/', timeout=10)
+                    time.sleep(1)
                     
-                    if not rows:
-                        rows = soup.find_all('tr', class_=re.compile('row|product|item'))
+                    # Теперь на страницу с ипотекой
+                    url = "https://www.banki.ru/products/ipoteka/"
+                    response = session.get(url, timeout=10)
                     
-                    for row in rows[:20]:
-                        try:
-                            # Ищем название банка
-                            name_tag = row.find(['a', 'span', 'td'], 
-                                              class_=re.compile('name|title|bank'))
-                            if not name_tag:
-                                continue
-                            
-                            bank_name = name_tag.get_text().strip()
-                            bank_name = re.sub(r'\s+', ' ', bank_name)
-                            
-                            # Ищем ставку
-                            row_text = row.get_text()
-                            rate = self.extract_rate(row_text)
-                            
-                            if bank_name and rate and len(bank_name) < 40:
-                                self.all_rates[bank_name] = rate
-                                found_banks += 1
-                                print(f"    ✓ {bank_name[:30]}: {rate}%")
+                    if response.status_code == 200:
+                        soup = BeautifulSoup(response.text, 'html.parser')
+                        
+                        # Ищем банки
+                        found_banks = 0
+                        rows = soup.find_all('tr', {'data-test': 'row'})
+                        
+                        if not rows:
+                            rows = soup.find_all('tr', class_=re.compile('row|product'))
+                        
+                        for row in rows[:20]:
+                            try:
+                                row_text = row.get_text()
+                                # Ищем название банка
+                                bank_match = re.search(r'([А-Я][а-я]+(?:\s+[А-Я][а-я]+)*)', row_text)
+                                if not bank_match:
+                                    continue
                                 
-                        except Exception as e:
-                            continue
-                    
-                    if found_banks > 0:
-                        print(f"    ✅ Найдено банков: {found_banks}")
-                        return True
+                                bank_name = bank_match.group(1).strip()
+                                rate = self.extract_rate(row_text)
+                                
+                                if bank_name and rate and len(bank_name) < 40:
+                                    self.all_rates[bank_name] = rate
+                                    found_banks += 1
+                                    print(f"    ✓ {bank_name[:30]}: {rate}%")
+                                    
+                            except Exception:
+                                continue
+                        
+                        if found_banks > 0:
+                            print(f"    ✅ Найдено банков: {found_banks}")
+                            return True
+                        else:
+                            print(f"    ⚠️ Банки не найдены, пробуем другой прокси")
+                            self.proxy_manager.report_failure()
+                            
                     else:
-                        print(f"    ⚠️ Банки не найдены")
-                        return False
-                else:
-                    print(f"    ⚠️ Статус {response.status_code}")
-                    return False
+                        print(f"    ⚠️ Статус {response.status_code}")
+                        self.proxy_manager.report_failure()
+                        
+                except Exception as e:
+                    print(f"    ⚠️ Ошибка через прокси: {e}")
+                    self.proxy_manager.report_failure()
+                    
+                time.sleep(1)
+            
+            return False
                     
         except Exception as e:
             print(f"    ✗ Ошибка парсинга: {e}")
@@ -188,22 +250,9 @@ class BankiRuParser:
             pass
         
         time.sleep(1)
-        
-        # Альфа
-        try:
-            print("  Парсим Альфа-Банк...")
-            url = "https://alfabank.ru/get-money/mortgage/"
-            response = requests.get(url, timeout=10)
-            if response.status_code == 200:
-                rate = self.extract_rate(response.text)
-                if rate:
-                    self.all_rates['Альфа-Банк'] = rate
-                    print(f"    ✓ Альфа-Банк: {rate}%")
-        except:
-            pass
     
     def add_fallback_rates(self):
-        """Добавляет запасные ставки для отсутствующих банков"""
+        """Добавляет запасные ставки"""
         added = 0
         for bank, rate in self.fallback_rates.items():
             if bank not in self.all_rates:
@@ -217,32 +266,25 @@ class BankiRuParser:
         """Запускает все парсеры"""
         print("  Запускаем умный парсинг с прокси...")
         
-        # Пробуем спарсить Банки.ру с прокси
+        # Пробуем Банки.ру
         banki_success = self.parse_banki_ru()
         
         if not banki_success:
-            print("  ⚠️ Банки.ру не спарсился, пробуем без прокси...")
+            print("  ⚠️ Банки.ру не спарсился, парсим отдельные банки...")
             self.parse_individual_banks()
         else:
-            time.sleep(2)
+            time.sleep(1)
             self.parse_individual_banks()
         
-        # Добавляем запасные ставки
+        # Добавляем запасные
         self.add_fallback_rates()
         
-        # Фильтруем
-        filtered_rates = {}
-        for bank, rate in self.all_rates.items():
-            if 5 <= rate <= 35:
-                filtered_rates[bank] = rate
-        
-        self.all_rates = filtered_rates
         return self.all_rates
 
 # ===== ФОРМАТИРОВАНИЕ =====
 def format_message(rates_dict):
     if not rates_dict:
-        return "😔 Не удалось получить актуальные ставки."
+        return "😔 Не удалось получить ставки"
     
     rates_list = [(bank, rate) for bank, rate in rates_dict.items()]
     rates_list.sort(key=lambda x: x[1])
@@ -272,9 +314,8 @@ def format_message(rates_dict):
     
     text += f"""
 
-📅 Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')} (МСК)
-📊 Всего банков: {len(rates_list)}
-🔄 Прокси: активны
+📅 {datetime.now().strftime('%d.%m.%Y %H:%M')} (МСК)
+📊 Всего: {len(rates_list)} банков
 """
     
     return text
@@ -291,40 +332,28 @@ def send_to_channel(text):
     try:
         response = requests.post(url, data=data, timeout=10)
         if response.status_code == 200:
-            print("  ✅ Успешно отправлено в канал")
-        else:
-            print(f"  ❌ Ошибка: {response.text}")
+            print("  ✅ Отправлено!")
     except Exception as e:
-        print(f"  ❌ Ошибка отправки: {e}")
+        print(f"  ❌ Ошибка: {e}")
 
 # ===== ГЛАВНАЯ =====
 def main():
     print("=" * 50)
-    print("🚀 ЗАПУСК УМНОГО ПАРСИНГА С ПРОКСИ")
+    print("🚀 ЗАПУСК С ПРОКСИ")
     print(f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
     print("=" * 50)
     
     if not BOT_TOKEN or not CHANNEL_ID:
-        print("❌ Ошибка: не заданы BOT_TOKEN или CHANNEL_ID")
+        print("❌ Ошибка настроек")
         return
     
-    print(f"📢 Канал: {CHANNEL_ID}")
-    
-    print("\n🔍 НАЧАЛО ПАРСИНГА")
     parser = BankiRuParser()
     rates = parser.collect_all_rates()
     
-    print(f"\n📊 ИТОГО: {len(rates)} банков")
-    
-    print("\n✏️ ФОРМИРОВАНИЕ СООБЩЕНИЯ")
+    print(f"\n📊 Всего: {len(rates)} банков")
     message = format_message(rates)
-    
-    print("\n📤 ОТПРАВКА В КАНАЛ")
     send_to_channel(message)
-    
-    print("\n" + "=" * 50)
-    print("✅ БОТ ЗАВЕРШИЛ РАБОТУ")
-    print("=" * 50)
+    print("\n✅ ГОТОВО")
 
 if __name__ == "__main__":
     main()
