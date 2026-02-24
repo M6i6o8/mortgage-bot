@@ -1,0 +1,5 @@
+# Secrets
+.env
+*.session
+__pycache__/
+*.pyc
