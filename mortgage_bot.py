@@ -1,6 +1,6 @@
 """
-Ипотечный бот - ОБХОДНАЯ ВЕРСИЯ
-Используем только то, что гарантированно работает
+Ипотечный бот - ПОЛНЫЙ АВТОПИЛОТ с RSS-парсингом Telegram-каналов
+Запуск на GitHub Actions
 """
 
 import requests
@@ -10,234 +10,174 @@ from datetime import datetime
 import os
 import random
 import time
+import warnings
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # ===== НАСТРОЙКИ =====
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 CHANNEL_ID = os.environ.get('CHANNEL_ID', '')
 
-# ===== ПРОКСИ ТОЛЬКО HTTP (без SOCKS) =====
-class SimpleProxyManager:
+# ===== ПАРСЕР TELEGRAM-КАНАЛОВ ЧЕРЕЗ RSS =====
+class TelegramRSSParser:
     def __init__(self):
-        self.proxies = []
-        self.load_proxies()
+        self.channels = {
+            'banki_ru': 'https://rsshub.app/telegram/channel/banki_ru',
+            'ipoteka_rus': 'https://rsshub.app/telegram/channel/ipoteka_rus',
+            'tbank_news': 'https://rsshub.app/telegram/channel/tbank_news'
+        }
+        
+        # Резервные RSS-мосты
+        self.backup_bridges = [
+            'https://rss-bridge.org/bridge01/?action=display&bridge=TelegramBridge&channel=',
+            'https://tg.i-c-a.su/rss/',
+            'https://rss.telegram.org/'
+        ]
     
-    def load_proxies(self):
-        """Только HTTP прокси, которые точно работают"""
-        try:
-            # Проверенный источник
-            url = "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"
-            response = requests.get(url, timeout=10)
-            if response.status_code == 200:
-                all_proxies = response.text.strip().split('\n')
-                # Берем только свежие (первые 50)
-                self.proxies = [p.strip() for p in all_proxies if p.strip()][:30]
-                print(f"  ✅ Загружено HTTP прокси: {len(self.proxies)}")
-        except:
-            self.proxies = []
-    
-    def get_proxy(self):
-        if not self.proxies:
-            self.load_proxies()
-        if self.proxies:
-            proxy = random.choice(self.proxies)
-            return {'http': f'http://{proxy}', 'https': f'http://{proxy}'}
-        return None
-
-# ===== СПЕЦИАЛЬНЫЙ ПАРСЕР ДЛЯ API =====
-class APIParser:
-    def __init__(self):
-        self.proxy_manager = SimpleProxyManager()
-        self.all_rates = {}
-    
-    def get_headers(self):
-        """Заголовки как у браузера"""
+    def get_random_headers(self):
+        """Заголовки для запроса"""
         return {
             'User-Agent': random.choice([
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36',
-            ]),
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15',
+            ])
         }
     
-    def extract_rate(self, text):
-        """Универсальное извлечение ставки"""
-        if not text:
-            return None
-        
-        # Ищем числа рядом с процентами
-        patterns = [
-            r'(\d+[.,]\d+)%',
-            r'(\d+)%',
-            r'от\s*(\d+[.,]\d+)',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                rate = match.group(1).replace(',', '.')
-                try:
-                    rate = float(rate)
-                    if 5 <= rate <= 35:
-                        return rate
-                except:
-                    pass
-        return None
-    
-    # ===== ИСТОЧНИК 1: Прямой API ЦБ РФ (всегда работает) =====
-    def parse_cbr_api(self):
-        """API Центробанка - официальные данные"""
-        print("  [1/5] API ЦБ РФ...")
+    def parse_channel_rss(self, channel_name, url):
+        """Парсит RSS-ленту канала"""
         try:
-            url = "https://www.cbr.ru/scripts/XML_daily.asp"
-            response = requests.get(url, headers=self.get_headers(), timeout=10)
+            headers = self.get_random_headers()
+            response = requests.get(url, headers=headers, timeout=10)
             
-            if response.status_code == 200:
-                # Парсим XML
-                import xml.etree.ElementTree as ET
-                root = ET.fromstring(response.content)
+            if response.status_code != 200:
+                return []
+            
+            soup = BeautifulSoup(response.text, 'xml')
+            items = soup.find_all('item') or soup.find_all('entry')
+            
+            messages = []
+            for item in items[:15]:  # Последние 15 сообщений
+                title = item.find('title')
+                description = item.find('description')
+                pub_date = item.find('pubDate') or item.find('published')
                 
-                # Ищем ключевую ставку
-                for valute in root.findall('.//Valute'):
-                    name = valute.find('Name')
-                    if name is not None and 'Ключевая ставка' in name.text:
-                        value = valute.find('Value')
-                        if value is not None:
-                            rate = float(value.text.replace(',', '.'))
-                            self.all_rates['Ключевая ставка ЦБ'] = rate
-                            print(f"    ✓ ЦБ РФ: {rate}%")
-                            return True
+                text = ''
+                if title and title.text:
+                    text += title.text + ' '
+                if description and description.text:
+                    text += description.text
+                
+                if text.strip():
+                    messages.append({
+                        'text': text,
+                        'date': pub_date.text if pub_date else '',
+                        'channel': channel_name
+                    })
+            
+            return messages
+            
         except Exception as e:
-            print(f"    ⚠️ Ошибка: {e}")
-        return False
+            print(f"    ⚠️ Ошибка RSS {channel_name}: {e}")
+            return []
     
-    # ===== ИСТОЧНИК 2: Парсинг новостей Яндекса =====
-    def parse_yandex_news(self):
-        """Новости Яндекса - ищем упоминания ставок"""
-        print("  [2/5] Яндекс.Новости...")
-        try:
-            url = "https://yandex.ru/news/rubric/finance"
-            response = requests.get(url, headers=self.get_headers(), timeout=10)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                texts = soup.find_all(['h2', 'div'], class_=re.compile('title|text|content'))
-                
-                for text in texts[:20]:
-                    text_content = text.get_text()
-                    # Ищем упоминания банков и ставок
-                    banks = re.findall(r'(Сбер|ВТБ|Альфа|Т-Банк|Газпром)', text_content)
-                    rate = self.extract_rate(text_content)
-                    
-                    if banks and rate:
-                        for bank in banks:
-                            self.all_rates[bank] = rate
-                            print(f"    ✓ {bank}: {rate}% (из новостей)")
-                            return True
-        except:
-            pass
-        return False
-    
-    # ===== ИСТОЧНИК 3: Google Finance =====
-    def parse_google_finance(self):
-        """Google Finance - макроэкономика"""
-        print("  [3/5] Google Finance...")
-        try:
-            url = "https://www.google.com/finance/markets/indexes"
-            response = requests.get(url, headers=self.get_headers(), timeout=10)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                text = soup.get_text()
-                
-                # Ищем ключевую ставку РФ
-                if 'россия' in text.lower() or 'russia' in text.lower():
-                    rate = self.extract_rate(text)
-                    if rate:
-                        self.all_rates['Рыночная ставка'] = rate
-                        print(f"    ✓ Рыночная ставка: {rate}%")
-                        return True
-        except:
-            pass
-        return False
-    
-    # ===== ИСТОЧНИК 4: Статика (реальные ставки с официальных сайтов) =====
-    def add_static_rates(self):
-        """Добавляем реальные ставки из официальных источников"""
-        print("  [4/5] Официальные ставки...")
+    def parse_all_channels(self):
+        """Парсит все каналы и ищет ставки"""
+        print("  📡 Парсим Telegram-каналы через RSS...")
         
-        # Эти ставки мы проверяли вручную
-        static_rates = {
-            'Сбербанк': 21.0,      # с сайта sberbank.ru
-            'ВТБ': 20.1,            # с сайта vtb.ru
-            'Альфа-Банк': 20.5,      # с сайта alfabank.ru
-            'Т-Банк': 16.9,          # с сайта tbank.ru
-            'Газпромбанк': 20.8,     # с сайта gazprombank.ru
-            'Россельхозбанк': 20.2,  # с сайта rshb.ru
-            'Промсвязьбанк': 19.49,  # новости
-            'Уралсиб': 18.79,        # новости
-            'Банк Открытие': 21.1,   # с сайта открытие.рф
-            'Совкомбанк': 20.9,      # с сайта sovcombank.ru
-            'МТС Банк': 20.7,        # с сайта mtsbank.ru
-            'Банк ДОМ.РФ': 20.2,     # с сайта domrf.ru
-            'Банк Санкт-Петербург': 18.49,  # новости
-            'Транскапиталбанк': 20.25,      # новости
-            'ВБРР': 20.4,                    # новости
+        all_messages = []
+        bank_rates = {}
+        
+        # Словарь банков и их паттернов
+        bank_patterns = {
+            'Сбербанк': r'сбер[банк]*|sber',
+            'ВТБ': r'втб|vtb',
+            'Альфа-Банк': r'альфа|alfa',
+            'Т-Банк': r'т[- ]?банк|тинькофф|tbank|tinkoff',
+            'Газпромбанк': r'газпром|gazprombank',
+            'Россельхозбанк': r'россельхоз|рсхб|rshb',
+            'Промсвязьбанк': r'промсвязь|псб|psb',
+            'Уралсиб': r'уралсиб|uralsib',
+            'Банк Открытие': r'открытие|otkritie',
+            'Совкомбанк': r'совком|sovcombank',
+            'МТС Банк': r'мтс|mts',
+            'Банк ДОМ.РФ': r'дом\.рф|domrf',
+            'Банк Санкт-Петербург': r'санкт-петербург|bspb',
+            'Транскапиталбанк': r'транскапитал|tcb',
+            'ВБРР': r'вбрр|vbrr',
         }
         
-        for bank, rate in static_rates.items():
+        # Парсим каждый канал
+        for channel_name, url in self.channels.items():
+            messages = self.parse_channel_rss(channel_name, url)
+            all_messages.extend(messages)
+            print(f"    📍 @{channel_name}: {len(messages)} сообщений")
+        
+        # Ищем ставки в сообщениях
+        for msg in all_messages:
+            text = msg['text'].lower()
+            
+            # Ищем ставку (число с %)
+            rate_matches = re.findall(r'(\d+[.,]\d+)%', msg['text'])
+            if not rate_matches:
+                continue
+            
+            rate = float(rate_matches[0].replace(',', '.'))
+            
+            # Проверяем, какой банк упомянут
+            for bank_name, pattern in bank_patterns.items():
+                if re.search(pattern, text, re.IGNORECASE):
+                    if bank_name not in bank_rates or rate < bank_rates[bank_name]:
+                        bank_rates[bank_name] = rate
+                        print(f"      ✅ {bank_name}: {rate}% (из @{msg['channel']})")
+        
+        return bank_rates
+
+# ===== ОСНОВНОЙ ПАРСЕР =====
+class AutoParser:
+    def __init__(self):
+        self.all_rates = {}
+        self.telegram_parser = TelegramRSSParser()
+        
+        # Базовые ставки (на случай если ничего не спарсится)
+        self.base_rates = {
+            'Сбербанк': 21.0,
+            'ВТБ': 20.1,
+            'Альфа-Банк': 20.5,
+            'Т-Банк': 16.9,
+            'Газпромбанк': 20.8,
+            'Россельхозбанк': 20.2,
+            'Промсвязьбанк': 19.49,
+            'Уралсиб': 18.79,
+            'Банк Открытие': 21.1,
+            'Совкомбанк': 20.9,
+            'МТС Банк': 20.7,
+            'Банк ДОМ.РФ': 20.2,
+            'Банк Санкт-Петербург': 18.49,
+            'Транскапиталбанк': 20.25,
+            'ВБРР': 20.4,
+        }
+    
+    # ===== ГЛАВНЫЙ СБОР =====
+    def collect_all_rates(self):
+        print("\n  🚀 ЗАПУСК АВТОМАТИЧЕСКОГО СБОРА")
+        
+        # Парсим Telegram-каналы через RSS
+        telegram_rates = self.telegram_parser.parse_all_channels()
+        
+        # Добавляем найденные ставки
+        for bank, rate in telegram_rates.items():
             self.all_rates[bank] = rate
-            print(f"    ✓ {bank}: {rate}%")
         
-        return True
-    
-    # ===== ИСТОЧНИК 5: Ручной ввод (для экстренных случаев) =====
-    def add_manual_rates(self):
-        """Добавляем ставки, которые мы можем подтвердить"""
-        print("  [5/5] Подтвержденные ставки...")
-        
-        # Эти ставки мы видели своими глазами
-        manual_rates = {
-            'Т-Банк': 16.9,          # реклама на сайте
-            'ВТБ': 19.3,              # официальное заявление
-            'Уралсиб': 18.79,         # новости февраля
-            'Промсвязьбанк': 19.49,   # новости февраля
-            'Банк Санкт-Петербург': 18.49,  # новости февраля
-        }
-        
-        for bank, rate in manual_rates.items():
+        # Добавляем базовые ставки для банков, которых нет
+        for bank, rate in self.base_rates.items():
             if bank not in self.all_rates:
                 self.all_rates[bank] = rate
-                print(f"    ✓ {bank}: {rate}%")
+                print(f"    ➕ {bank}: {rate}% (базовая)")
         
-        return True
-    
-    def collect_all_rates(self):
-        """Собираем всё что можно"""
-        print("\n  🚀 ЗАПУСК 5 ИСТОЧНИКОВ (ОБХОДНАЯ СТРАТЕГИЯ)")
-        
-        # Пробуем официальные API
-        self.parse_cbr_api()
-        time.sleep(1)
-        
-        # Пробуем новости
-        self.parse_yandex_news()
-        time.sleep(1)
-        
-        # Пробуем Google
-        self.parse_google_finance()
-        time.sleep(1)
-        
-        # Добавляем проверенные статические данные
-        self.add_static_rates()
-        
-        # Добавляем подтвержденные из новостей
-        self.add_manual_rates()
-        
-        print(f"\n  ✅ ВСЕГО УНИКАЛЬНЫХ БАНКОВ: {len(self.all_rates)}")
+        print(f"\n  ✅ ВСЕГО БАНКОВ: {len(self.all_rates)}")
         return self.all_rates
 
-# ===== ФОРМАТИРОВАНИЕ =====
+# ===== ФОРМАТИРОВАНИЕ СООБЩЕНИЯ =====
 def format_message(rates_dict):
     if not rates_dict:
         return "😔 Не удалось получить ставки"
@@ -271,12 +211,12 @@ def format_message(rates_dict):
 
 📅 {datetime.now().strftime('%d.%m.%Y %H:%M')} (МСК)
 📊 Всего банков: {len(rates_list)}
-🔄 Источник: проверенные данные + официальные источники
+🔄 Источник: Telegram-каналы + база
 """
     
     return text
 
-# ===== ОТПРАВКА =====
+# ===== ОТПРАВКА В КАНАЛ =====
 def send_to_channel(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = {
@@ -289,29 +229,29 @@ def send_to_channel(text):
         response = requests.post(url, data=data, timeout=10)
         if response.status_code == 200:
             print("  ✅ Отправлено в канал!")
+        else:
+            print(f"  ❌ Ошибка: {response.text}")
     except Exception as e:
         print(f"  ❌ Ошибка: {e}")
 
 # ===== ГЛАВНАЯ =====
 def main():
     print("=" * 60)
-    print("🚀 ОБХОДНАЯ ВЕРСИЯ - 5 ИСТОЧНИКОВ")
+    print("🚀 ИПОТЕЧНЫЙ БОТ - АВТОПИЛОТ (RSS)")
     print(f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
     print("=" * 60)
     
     if not BOT_TOKEN or not CHANNEL_ID:
-        print("❌ Ошибка настроек")
+        print("❌ Ошибка: не заданы BOT_TOKEN или CHANNEL_ID")
         return
     
-    parser = APIParser()
+    parser = AutoParser()
     rates = parser.collect_all_rates()
     
-    if rates:
-        message = format_message(rates)
-        send_to_channel(message)
-        print("\n✅ ГОТОВО")
-    else:
-        print("❌ КРИТИЧЕСКАЯ ОШИБКА")
+    message = format_message(rates)
+    send_to_channel(message)
+    
+    print("\n✅ ГОТОВО")
 
 if __name__ == "__main__":
     main()
