@@ -2,4 +2,4 @@ requests
 beautifulsoup4
 lxml
 telegram-pm
-pysocks  # для поддержки SOCKS5
+PySocks
