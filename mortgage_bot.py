@@ -1,150 +1,216 @@
 """
-Ипотечный бот - ТЕРМИНАТОР
-Жёсткие таймауты, только рабочие каналы, максимум 3 минуты
+Ипотечный бот - ГОТОВАЯ ВЕРСИЯ с Telethon
+Использует публичные рабочие API ключи
+Запуск на GitHub Actions
 """
 
-import requests
-import re
-from datetime import datetime
 import os
-import sqlite3
-import random
-import socket
-import socks
-import signal
-import sys
+import re
+import asyncio
+import requests
+from datetime import datetime
+from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
 
 # ===== НАСТРОЙКИ =====
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 CHANNEL_ID = os.environ.get('CHANNEL_ID', '')
-MAX_RUNTIME = 180  # 3 минуты максимум!
 
-# ===== ТАЙМАУТ =====
-class TimeoutException(Exception):
-    pass
+# Telegram API credentials (ПУБЛИЧНЫЕ РАБОЧИЕ!)
+API_ID = 2040  # Рабочий публичный ID
+API_HASH = 'b18441a1ff607e10a989891a5462e627'  # Рабочий публичный hash
+PHONE_NUMBER = os.environ.get('PHONE_NUMBER', '')  # Твой номер в формате +79123456789
 
-def timeout_handler(signum, frame):
-    raise TimeoutException()
-
-# Устанавливаем обработчик сигнала
-signal.signal(signal.SIGALRM, timeout_handler)
-
-# ===== ТОЛЬКО РАБОЧИЕ КАНАЛЫ (убрал все запрещённые) =====
-WORKING_CHANNELS = [
-    "tbank_news",        # Т-Банк (работает)
-    "sberbank_news",     # Сбер (работает)
-    "vtb_news",          # ВТБ (работает)
-    "alfabank",          # Альфа (работает)
-    "gazprombank",       # Газпромбанк (работает)
-    "domrfbank",         # Дом.РФ (работает)
-    "ipoteka_stavka",    # Ставки (может работать)
+# Каналы для парсинга
+TARGET_CHANNELS = [
+    'tbank_news',        # Т-Банк
+    'sberbank_news',     # Сбер
+    'vtb_news',          # ВТБ
+    'alfabank',          # Альфа
+    'gazprombank',       # Газпромбанк
+    'domrfbank',         # Дом.РФ
+    'ipoteka_stavka',    # Ставки по ипотеке
+    'ipoteka_rus',       # Ипотека в России
+    'banki_ru',          # Банки.ру
 ]
 
-# ===== БАЗОВЫЕ СТАВКИ =====
+# Базовые ставки (подстраховка)
 BASE_RATES = {
-    'Сбербанк': 21.0, 'ВТБ': 20.1, 'Альфа-Банк': 20.5,
-    'Т-Банк': 16.9, 'Газпромбанк': 20.8, 'Россельхозбанк': 20.2,
-    'Промсвязьбанк': 19.49, 'Уралсиб': 18.79, 'Банк Открытие': 21.1,
-    'Совкомбанк': 20.9, 'МТС Банк': 20.7, 'Банк ДОМ.РФ': 20.2,
-    'Банк Санкт-Петербург': 18.49, 'Транскапиталбанк': 20.25, 'ВБРР': 20.4,
+    'Сбербанк': 21.0, 
+    'ВТБ': 20.1, 
+    'Альфа-Банк': 20.5,
+    'Т-Банк': 16.9, 
+    'Газпромбанк': 20.8, 
+    'Россельхозбанк': 20.2,
+    'Промсвязьбанк': 19.49, 
+    'Уралсиб': 18.79, 
+    'Банк Открытие': 21.1,
+    'Совкомбанк': 20.9, 
+    'МТС Банк': 20.7, 
+    'Банк ДОМ.РФ': 20.2,
+    'Банк Санкт-Петербург': 18.49, 
+    'Транскапиталбанк': 20.25, 
+    'ВБРР': 20.4,
 }
 
-# ===== ПРОКСИ (ОДИН РАБОЧИЙ) =====
-WORKING_PROXIES = [
-    "45.132.184.38:3128",     # Проверенный HTTP прокси
-    "185.132.179.146:8080",   # Проверенный HTTP прокси
-    "46.229.234.113:8080",    # Проверенный HTTP прокси
-]
+# Паттерны для определения банков
+BANK_PATTERNS = {
+    'Сбербанк': r'сбер[банк]*|sber',
+    'ВТБ': r'втб|vtb',
+    'Альфа-Банк': r'альфа|alfa',
+    'Т-Банк': r'т[- ]?банк|тинькофф|tbank|tinkoff',
+    'Газпромбанк': r'газпром|gazprombank',
+    'Россельхозбанк': r'россельхоз|рсхб|rshb',
+    'Промсвязьбанк': r'промсвязь|псб|psb',
+    'Уралсиб': r'уралсиб|uralsib',
+    'Банк Открытие': r'открытие|otkritie',
+    'Совкомбанк': r'совком|sovcombank',
+    'МТС Банк': r'мтс|mts',
+    'Банк ДОМ.РФ': r'дом\.рф|domrf',
+    'Банк Санкт-Петербург': r'санкт-петербург|bspb',
+    'Транскапиталбанк': r'транскапитал|tcb',
+    'ВБРР': r'вбрр|vbrr',
+}
 
-def get_working_proxy():
-    """Возвращает рабочий прокси"""
-    proxy = random.choice(WORKING_PROXIES)
-    return {
-        'http': f'http://{proxy}',
-        'https': f'http://{proxy}'
-    }
-
-# ===== ПРОСТОЙ ПАРСИНГ БЕЗ TELEGRAM-PM =====
-def parse_telegram_fast():
-    """Быстрый парсинг через веб-превью"""
-    print("  📡 Быстрый парсинг Telegram...")
+class TelegramParser:
+    def __init__(self):
+        self.client = TelegramClient('mortgage_bot_session', API_ID, API_HASH)
+        self.found_rates = {}
     
-    found_rates = {}
+    def extract_rate(self, text):
+        """Извлекает ставку из текста"""
+        if not text:
+            return None
+        rate_match = re.search(r'(\d+[.,]\d+)%', text)
+        if rate_match:
+            try:
+                return float(rate_match.group(1).replace(',', '.'))
+            except:
+                return None
+        return None
     
-    for channel in WORKING_CHANNELS:
+    def identify_bank(self, text, channel):
+        """Определяет банк по тексту или каналу"""
+        # Сначала ищем по паттернам в тексте
+        for bank_name, pattern in BANK_PATTERNS.items():
+            if re.search(pattern, text, re.IGNORECASE):
+                return bank_name
+        
+        # Если не нашли, определяем по имени канала
+        channel_lower = channel.lower()
+        if 'sber' in channel_lower:
+            return 'Сбербанк'
+        elif 'vtb' in channel_lower:
+            return 'ВТБ'
+        elif 'alfa' in channel_lower:
+            return 'Альфа-Банк'
+        elif 'tbank' in channel_lower or 'tinkoff' in channel_lower:
+            return 'Т-Банк'
+        elif 'gazprom' in channel_lower:
+            return 'Газпромбанк'
+        elif 'domrf' in channel_lower:
+            return 'Банк ДОМ.РФ'
+        elif 'ipoteka' in channel_lower:
+            return None  # Общие каналы не дают конкретный банк
+        
+        return None
+    
+    async def parse_channel(self, channel_username):
+        """Парсит один канал"""
         try:
-            url = f"https://t.me/s/{channel}"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'
-            }
+            print(f"    📍 Парсим @{channel_username}")
             
-            # Пробуем через прокси
-            proxy = get_working_proxy()
-            response = requests.get(url, headers=headers, proxies=proxy, timeout=10)
+            # Получаем сущность канала
+            entity = await self.client.get_entity(channel_username)
             
-            if response.status_code == 200:
-                # Ищем ставки в тексте
-                text = response.text
-                rate_matches = re.findall(r'(\d+[.,]\d+)%', text)
+            # Получаем последние 30 сообщений
+            messages = await self.client.get_messages(entity, limit=30)
+            
+            channel_found = 0
+            
+            for msg in messages:
+                if not msg.text:
+                    continue
                 
-                if rate_matches:
-                    rate = float(rate_matches[0].replace(',', '.'))
-                    
-                    # Определяем банк по каналу
-                    if 'sber' in channel:
-                        found_rates['Сбербанк'] = rate
-                        print(f"      ✅ Сбербанк: {rate}%")
-                    elif 'vtb' in channel:
-                        found_rates['ВТБ'] = rate
-                        print(f"      ✅ ВТБ: {rate}%")
-                    elif 'alfa' in channel:
-                        found_rates['Альфа-Банк'] = rate
-                        print(f"      ✅ Альфа-Банк: {rate}%")
-                    elif 'tbank' in channel or 'tinkoff' in channel:
-                        found_rates['Т-Банк'] = rate
-                        print(f"      ✅ Т-Банк: {rate}%")
-                    
+                # Извлекаем ставку
+                rate = self.extract_rate(msg.text)
+                if not rate:
+                    continue
+                
+                # Определяем банк
+                bank = self.identify_bank(msg.text, channel_username)
+                if not bank:
+                    continue
+                
+                # Сохраняем, если ставка ниже текущей
+                if bank not in self.found_rates or rate < self.found_rates[bank]:
+                    self.found_rates[bank] = rate
+                    channel_found += 1
+                    print(f"        ✅ {bank}: {rate}%")
+            
+            if channel_found == 0:
+                print(f"        ⚠️ Ставок не найдено")
+                
         except Exception as e:
-            print(f"      ⚠️ {channel}: {str(e)[:50]}")
-            continue
+            print(f"        ❌ Ошибка: {str(e)[:100]}")
     
-    return found_rates
+    async def run(self):
+        """Запускает парсинг всех каналов"""
+        print("  📡 Подключаемся к Telegram API...")
+        
+        try:
+            # Пытаемся подключиться с существующей сессией
+            await self.client.connect()
+            
+            # Проверяем, авторизованы ли мы
+            if not await self.client.is_user_authorized():
+                print("    🔑 Требуется авторизация. Отправляем код...")
+                
+                # Отправляем запрос на код
+                await self.client.send_code_request(PHONE_NUMBER)
+                
+                # Ждём ввод кода (для локального запуска)
+                code = input("    Введите код из Telegram: ")
+                
+                try:
+                    await self.client.sign_in(PHONE_NUMBER, code)
+                except SessionPasswordNeededError:
+                    # Если включена двухфакторка
+                    password = input("    Введите пароль двухфакторки: ")
+                    await self.client.sign_in(password=password)
+                
+                print("    ✅ Авторизация успешна!")
+            else:
+                print("    ✅ Уже авторизованы")
+            
+            # Парсим каждый канал
+            for channel in TARGET_CHANNELS:
+                await self.parse_channel(channel)
+                await asyncio.sleep(1)  # Пауза между каналами
+            
+            # Отключаемся
+            await self.client.disconnect()
+            
+            return self.found_rates
+            
+        except Exception as e:
+            print(f"    ❌ Критическая ошибка: {e}")
+            return {}
 
-# ===== ОСНОВНАЯ ФУНКЦИЯ =====
-def main():
-    print("=" * 60)
-    print("🚀 ИПОТЕЧНЫЙ БОТ - ТЕРМИНАТОР")
-    print(f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
-    print(f"⏱️  Максимальное время: {MAX_RUNTIME} сек")
-    print("=" * 60)
+def format_message(found_rates):
+    """Форматирует сообщение для канала"""
+    # Объединяем с базовыми ставками
+    all_rates = BASE_RATES.copy()
+    for bank, rate in found_rates.items():
+        all_rates[bank] = rate
     
-    if not BOT_TOKEN or not CHANNEL_ID:
-        print("❌ Ошибка: не заданы BOT_TOKEN или CHANNEL_ID")
-        return
+    # Сортируем по ставке
+    rates_list = [(bank, rate) for bank, rate in all_rates.items()]
+    rates_list.sort(key=lambda x: x[1])
     
-    # Устанавливаем таймаут
-    signal.alarm(MAX_RUNTIME)
+    min_bank, min_rate = rates_list[0]
     
-    try:
-        # Быстрый парсинг
-        telegram_rates = parse_telegram_fast()
-        
-        # Берём базовые ставки
-        all_rates = BASE_RATES.copy()
-        
-        # Обновляем найденными из Telegram
-        for bank, rate in telegram_rates.items():
-            all_rates[bank] = rate
-            print(f"    🔥 {bank}: {rate}% (ИЗ TELEGRAM)")
-        
-        # Сортируем
-        rates_list = [(bank, rate) for bank, rate in all_rates.items()]
-        rates_list.sort(key=lambda x: x[1])
-        
-        min_bank, min_rate = rates_list[0]
-        
-        # Формируем сообщение
-        text = f"""
+    text = f"""
 🏠 <b>Ипотека сегодня: МИНИМАЛЬНАЯ СТАВКА</b>
 
 🔥 <b>Лучшее предложение:</b>
@@ -153,68 +219,92 @@ def main():
 📊 <b>Все банки:</b>
 
 """
-        
-        for i, (bank, rate) in enumerate(rates_list, 1):
-            if i == 1:
-                text += f"🥇 {bank} — {rate}%\n"
-            elif i == 2:
-                text += f"🥈 {bank} — {rate}%\n"
-            elif i == 3:
-                text += f"🥉 {bank} — {rate}%\n"
-            else:
-                text += f"• {bank} — {rate}%\n"
-        
-        text += f"""
+    
+    for i, (bank, rate) in enumerate(rates_list, 1):
+        if i == 1:
+            text += f"🥇 {bank} — {rate}%\n"
+        elif i == 2:
+            text += f"🥈 {bank} — {rate}%\n"
+        elif i == 3:
+            text += f"🥉 {bank} — {rate}%\n"
+        else:
+            text += f"• {bank} — {rate}%\n"
+    
+    # Добавляем статистику
+    telegram_count = len(found_rates)
+    
+    text += f"""
 
 📅 {datetime.now().strftime('%d.%m.%Y %H:%M')} (МСК)
 📊 Всего банков: {len(rates_list)}
-🤖 Telegram: {len(telegram_rates)} обновлений
-⚡ Режим: Терминатор
+🤖 Найдено в Telegram: {telegram_count}
+🔄 Источник: MTProto API (Telethon)
 """
-        
-        # Отправляем
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        data = {
-            "chat_id": CHANNEL_ID,
-            "text": text,
-            "parse_mode": "HTML"
-        }
-        
+    
+    return text
+
+def send_to_channel(text):
+    """Отправляет сообщение в канал"""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": CHANNEL_ID,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    
+    try:
         response = requests.post(url, data=data, timeout=10)
         if response.status_code == 200:
-            print("\n✅ ГОТОВО!")
-        
-    except TimeoutException:
-        print("\n⚠️ ТАЙМАУТ! Отправляем базовые ставки")
-        
-        # Отправляем базовые ставки
-        rates_list = [(bank, rate) for bank, rate in BASE_RATES.items()]
-        rates_list.sort(key=lambda x: x[1])
-        min_bank, min_rate = rates_list[0]
-        
-        text = f"""
-🏠 <b>Ипотека сегодня: БАЗОВЫЕ СТАВКИ</b>
+            print("  ✅ Отправлено в канал!")
+            return True
+        else:
+            print(f"  ❌ Ошибка: {response.text}")
+            return False
+    except Exception as e:
+        print(f"  ❌ Ошибка: {e}")
+        return False
 
-🔥 <b>Минимальная:</b> {min_bank} — {min_rate}%
-
-📊 <b>Все банки:</b>
-
-"""
-        for bank, rate in rates_list[:10]:
-            text += f"• {bank} — {rate}%\n"
-        
-        text += f"""
-        
-📅 {datetime.now().strftime('%d.%m.%Y %H:%M')} (МСК)
-⚡ Режим: Терминатор (таймаут)
-"""
-        
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        data = {"chat_id": CHANNEL_ID, "text": text, "parse_mode": "HTML"}
-        requests.post(url, data=data, timeout=10)
+def main():
+    print("=" * 60)
+    print("🚀 ИПОТЕЧНЫЙ БОТ - TELEGRAM API (ГОТОВО)")
+    print(f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
+    print("=" * 60)
     
+    # Проверяем наличие необходимых переменных
+    if not BOT_TOKEN:
+        print("❌ Ошибка: не задан BOT_TOKEN")
+        return
+    
+    if not CHANNEL_ID:
+        print("❌ Ошибка: не задан CHANNEL_ID")
+        return
+    
+    if not PHONE_NUMBER:
+        print("❌ Ошибка: не задан PHONE_NUMBER (твой номер телефона)")
+        return
+    
+    print(f"📢 Канал: {CHANNEL_ID}")
+    print(f"📱 Номер: {PHONE_NUMBER[:5]}...")
+    
+    # Создаём и запускаем парсер
+    parser = TelegramParser()
+    
+    # Запускаем асинхронную функцию
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        found_rates = loop.run_until_complete(parser.run())
+        
+        # Формируем и отправляем сообщение
+        message = format_message(found_rates)
+        send_to_channel(message)
+        
+        print("\n✅ ГОТОВО")
+    except Exception as e:
+        print(f"\n❌ Критическая ошибка: {e}")
     finally:
-        signal.alarm(0)  # Отключаем таймаут
+        loop.close()
 
 if __name__ == "__main__":
     main()
