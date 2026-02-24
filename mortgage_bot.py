@@ -8,7 +8,7 @@ import re
 from datetime import datetime
 import os
 import sqlite3
-from telegram_pm.run import run_tpm
+from telegram_pm import TelegramPM
 
 # ===== НАСТРОЙКИ =====
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
@@ -63,15 +63,18 @@ class TelegramParser:
         print("  📡 Парсим Telegram-каналы через telegram-pm...")
         
         try:
-            # Запускаем telegram-pm
-            run_tpm(
-                channels=self.channels,
+            # Инициализируем парсер
+            parser = TelegramPM(
                 db_path=self.db_path,
-                tg_iteration_in_preview_count=2,  # ~40 сообщений с канала
-                verbose=False
+                format="csv"  # или "json", "sqlite"
             )
             
-            # Подключаемся к базе
+            # Парсим каналы
+            for channel in self.channels:
+                print(f"    Парсим @{channel}...")
+                parser.parse_channel(channel, limit=30)
+            
+            # Подключаемся к базе SQLite
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
