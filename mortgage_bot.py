@@ -11,8 +11,7 @@ import os
 import random
 import time
 import warnings
-from proxyrotation import ProxyRotator
-from proxyrotation.modelling import Anonymity
+from litproxy import use_proxy, get_proxy_dict
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -20,7 +19,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 CHANNEL_ID = os.environ.get('CHANNEL_ID', '')
 
-# ===== ПРОКСИ РЕВОЛЬВЕР =====
+# ===== ПАРСЕР =====
 class BankiRuParser:
     def __init__(self):
         self.all_rates = {}
@@ -43,16 +42,6 @@ class BankiRuParser:
             'МТС Банк': 20.7,
         }
         
-        # Инициализируем ротатор прокси [citation:4]
-        self.rotator = ProxyRotator(
-            anonymity=Anonymity.high,  # Только анонимные прокси
-            countrycodeset={"RU"},      # Россия (быстрее)
-            livecheck=True,              # Проверять что прокси живые
-            maxshape=50,                 # Максимум прокси в пуле
-            schedule=3600.0,              # Обновлять список каждый час
-            secure=True                   # Только HTTPS прокси
-        )
-        
         # Заголовки как у реального браузера
         self.headers = {
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -60,10 +49,6 @@ class BankiRuParser:
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
             'Cache-Control': 'max-age=0',
         }
     
@@ -103,88 +88,70 @@ class BankiRuParser:
         return None
     
     def parse_banki_ru(self):
-        """Парсинг Банки.ру через ротацию прокси"""
+        """Парсинг Банки.ру через прокси"""
         try:
-            print("  Парсим Банки.ру с прокси-револьвером...")
+            print("  Парсим Банки.ру с прокси...")
             
-            # Получаем новый прокси [citation:4]
-            self.rotator.rotate()
-            
-            # Формируем заголовки
-            headers = self.headers.copy()
-            headers['User-Agent'] = self.get_random_user_agent()
-            
-            # Пробуем загрузить страницу
-            url = "https://www.banki.ru/products/ipoteka/"
-            
-            # Делаем запрос через выбранный прокси
-            session = requests.Session()
-            
-            # Настраиваем прокси для сессии
-            session.proxies = {
-                'http': f'http://{self.rotator.selected}',
-                'https': f'http://{self.rotator.selected}'
-            }
-            
-            # Сначала заходим на главную (получаем куки)
-            main_headers = headers.copy()
-            main_headers['Referer'] = 'https://www.google.com/'
-            
-            try:
-                session.get('https://www.banki.ru/', headers=main_headers, timeout=15)
+            # Получаем прокси и делаем запрос через контекстный менеджер
+            with use_proxy():
+                headers = self.headers.copy()
+                headers['User-Agent'] = self.get_random_user_agent()
+                
+                # Сначала заходим на главную (получаем куки)
+                session = requests.Session()
+                session.headers.update(headers)
+                
+                # Пробуем загрузить главную страницу
+                session.get('https://www.banki.ru/', timeout=15)
                 time.sleep(2)
-            except:
-                pass  # Если главная не грузится, пробуем сразу ипотеку
-            
-            # Теперь идём на страницу с ипотекой
-            response = session.get(url, headers=headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
                 
-                # Ищем разными способами
-                found_banks = 0
+                # Теперь идём на страницу с ипотекой
+                url = "https://www.banki.ru/products/ipoteka/"
+                response = session.get(url, timeout=15)
                 
-                # Способ 1: по data-test атрибутам
-                rows = soup.find_all('tr', {'data-test': 'row'})
-                
-                if not rows:
-                    # Способ 2: по классам
-                    rows = soup.find_all('tr', class_=re.compile('row|product|item'))
-                
-                for row in rows[:20]:
-                    try:
-                        # Ищем название банка
-                        name_tag = row.find(['a', 'span', 'td'], 
-                                          class_=re.compile('name|title|bank'))
-                        if not name_tag:
-                            continue
-                        
-                        bank_name = name_tag.get_text().strip()
-                        bank_name = re.sub(r'\s+', ' ', bank_name)
-                        
-                        # Ищем ставку
-                        row_text = row.get_text()
-                        rate = self.extract_rate(row_text)
-                        
-                        if bank_name and rate and len(bank_name) < 40:
-                            self.all_rates[bank_name] = rate
-                            found_banks += 1
-                            print(f"    ✓ {bank_name[:30]}: {rate}%")
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    
+                    # Ищем строки с банками
+                    found_banks = 0
+                    rows = soup.find_all('tr', {'data-test': 'row'})
+                    
+                    if not rows:
+                        rows = soup.find_all('tr', class_=re.compile('row|product|item'))
+                    
+                    for row in rows[:20]:
+                        try:
+                            # Ищем название банка
+                            name_tag = row.find(['a', 'span', 'td'], 
+                                              class_=re.compile('name|title|bank'))
+                            if not name_tag:
+                                continue
                             
-                    except Exception as e:
-                        continue
-                
-                if found_banks > 0:
-                    print(f"    ✅ Найдено банков: {found_banks}")
-                    return True
+                            bank_name = name_tag.get_text().strip()
+                            bank_name = re.sub(r'\s+', ' ', bank_name)
+                            
+                            # Ищем ставку
+                            row_text = row.get_text()
+                            rate = self.extract_rate(row_text)
+                            
+                            if bank_name and rate and len(bank_name) < 40:
+                                self.all_rates[bank_name] = rate
+                                found_banks += 1
+                                print(f"    ✓ {bank_name[:30]}: {rate}%")
+                                
+                        except Exception as e:
+                            continue
+                    
+                    if found_banks > 0:
+                        print(f"    ✅ Найдено банков: {found_banks}")
+                        return True
+                    else:
+                        print(f"    ⚠️ Банки не найдены")
+                        return False
                 else:
-                    print(f"    ⚠️ Банки не найдены, структура могла измениться")
+                    print(f"    ⚠️ Статус {response.status_code}")
                     return False
-            else:
-                print(f"    ⚠️ Статус {response.status_code}")
-                return False
-                
+                    
         except Exception as e:
             print(f"    ✗ Ошибка парсинга: {e}")
             return False
@@ -255,14 +222,12 @@ class BankiRuParser:
         
         if not banki_success:
             print("  ⚠️ Банки.ру не спарсился, пробуем без прокси...")
-            # Если с прокси не вышло, пробуем без прокси
             self.parse_individual_banks()
         else:
-            # Если с прокси вышло, всё равно парсим отдельные банки для сверки
             time.sleep(2)
             self.parse_individual_banks()
         
-        # Добавляем запасные ставки для недостающих банков
+        # Добавляем запасные ставки
         self.add_fallback_rates()
         
         # Фильтруем
@@ -274,9 +239,8 @@ class BankiRuParser:
         self.all_rates = filtered_rates
         return self.all_rates
 
-# ===== ФОРМАТИРОВАНИЕ СООБЩЕНИЯ =====
+# ===== ФОРМАТИРОВАНИЕ =====
 def format_message(rates_dict):
-    """Форматирует сообщение для канала"""
     if not rates_dict:
         return "😔 Не удалось получить актуальные ставки."
     
@@ -310,14 +274,13 @@ def format_message(rates_dict):
 
 📅 Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')} (МСК)
 📊 Всего банков: {len(rates_list)}
-🔄 Прокси-револьвер: активен
+🔄 Прокси: активны
 """
     
     return text
 
-# ===== ОТПРАВКА В КАНАЛ =====
+# ===== ОТПРАВКА =====
 def send_to_channel(text):
-    """Отправляет сообщение в канал"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = {
         "chat_id": CHANNEL_ID,
