@@ -1,7 +1,6 @@
 """
-Ипотечный бот - АВТОМАТИЧЕСКИЙ СБОРНИК МИНИМАЛЬНЫХ СТАВОК
-Никакого ручного обновления, всё само накапливается
-Запуск на GitHub Actions
+Ипотечный бот - С ОТОБРАЖЕНИЕМ ИЗМЕНЕНИЙ
+Показывает, какие ставки изменились за день
 """
 
 import os
@@ -9,31 +8,32 @@ import re
 import json
 import asyncio
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from telethon import TelegramClient
 
 # ===== НАСТРОЙКИ =====
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 CHANNEL_ID = os.environ.get('CHANNEL_ID', '')
 
-# Telegram API credentials (публичные)
+# Telegram API credentials
 API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
 
-# Файл для хранения истории ставок
+# Файлы для хранения данных
 HISTORY_FILE = 'rates_history.json'
+LAST_STATE_FILE = 'last_state.json'  # Для сравнения с предыдущим днём
 
-# Каналы для парсинга (только существующие)
+# Каналы для парсинга
 TARGET_CHANNELS = [
-    'tbank_news',           # Т-Банк
-    'alfabank',             # Альфа-Банк
-    'gazprombank',          # Газпромбанк
-    'ipoteka_stavka',       # Ставки по ипотеке
-    'ipoteka_rus',          # Ипотека в России
-    'ipoteka_segodnya',     # Ипотека сегодня (✅ золотой канал!)
+    'tbank_news',
+    'alfabank',
+    'gazprombank',
+    'ipoteka_stavka',
+    'ipoteka_rus',
+    'ipoteka_segodnya',
 ]
 
-# Начальные базовые ставки (только для первого запуска)
+# Начальные базовые ставки
 INITIAL_RATES = {
     'Сбербанк': 21.0,
     'ВТБ': 20.1,
@@ -52,7 +52,7 @@ INITIAL_RATES = {
     'ВБРР': 20.4,
 }
 
-# Паттерны для определения банков
+# Паттерны банков
 BANK_PATTERNS = {
     'Сбербанк': r'сбер[банк]*|sber|сбербанк',
     'ВТБ': r'втб|vtb|втб банк',
@@ -75,22 +75,24 @@ class RateHistory:
     """Класс для работы с историей ставок"""
     
     def __init__(self):
-        self.history = self.load()
+        self.history = self.load(HISTORY_FILE)
+        self.last_state = self.load(LAST_STATE_FILE)
+        self.changes = {}  # Изменения с прошлого раза
     
-    def load(self):
-        """Загружает историю из файла"""
-        if os.path.exists(HISTORY_FILE):
+    def load(self, filename):
+        """Загружает данные из файла"""
+        if os.path.exists(filename):
             try:
-                with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                with open(filename, 'r', encoding='utf-8') as f:
                     return json.load(f)
             except:
                 return {}
         return {}
     
-    def save(self):
-        """Сохраняет историю в файл"""
-        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(self.history, f, indent=2, ensure_ascii=False)
+    def save(self, filename, data):
+        """Сохраняет данные в файл"""
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
     
     def update(self, bank, rate):
         """Обновляет ставку для банка, если она ниже"""
@@ -103,7 +105,7 @@ class RateHistory:
         return False
     
     def get_final_rates(self):
-        """Возвращает финальные ставки (история + начальные для отсутствующих)"""
+        """Возвращает финальные ставки (история + начальные)"""
         final = {}
         
         # Сначала добавляем все из истории
@@ -117,6 +119,35 @@ class RateHistory:
                 print(f"    📊 Начальная ставка для {bank}: {rate}%")
         
         return final
+    
+    def detect_changes(self):
+        """Определяет изменения с прошлого запуска"""
+        self.changes = {}
+        current_rates = self.get_final_rates()
+        
+        for bank, current_rate in current_rates.items():
+            last_rate = self.last_state.get(bank)
+            
+            if last_rate is None:
+                # Новый банк
+                self.changes[bank] = {
+                    'old': None,
+                    'new': current_rate,
+                    'type': 'new'
+                }
+            elif abs(current_rate - last_rate) > 0.01:  # Ставка изменилась
+                self.changes[bank] = {
+                    'old': last_rate,
+                    'new': current_rate,
+                    'type': 'changed'
+                }
+        
+        return self.changes
+    
+    def save_state(self):
+        """Сохраняет текущее состояние для сравнения в будущем"""
+        self.save(LAST_STATE_FILE, self.get_final_rates())
+        self.save(HISTORY_FILE, self.history)
 
 class TelegramParser:
     def __init__(self):
@@ -177,10 +208,7 @@ class TelegramParser:
         try:
             print(f"    📍 Парсим @{channel_username}")
             
-            # Получаем сущность канала
             entity = await self.client.get_entity(channel_username)
-            
-            # Получаем последние 50 сообщений
             messages = await self.client.get_messages(entity, limit=50)
             
             channel_found = 0
@@ -189,17 +217,14 @@ class TelegramParser:
                 if not msg.text:
                     continue
                 
-                # Извлекаем ставку с фильтрацией
                 rate = self.extract_rate(msg.text)
                 if not rate:
                     continue
                 
-                # Определяем банк
                 bank = self.identify_bank(msg.text, channel_username)
                 if not bank:
                     continue
                 
-                # Обновляем историю
                 if self.rate_history.update(bank, rate):
                     self.new_finds += 1
                     print(f"        ✅ НОВАЯ МИНИМАЛЬНАЯ СТАВКА! {bank}: {rate}%")
@@ -210,48 +235,70 @@ class TelegramParser:
                 print(f"        ⚠️ Новых ставок не найдено")
                 
         except Exception as e:
-            error_msg = str(e)
-            if "username" in error_msg or "No user" in error_msg:
+            if "username" in str(e) or "No user" in str(e):
                 print(f"        ❌ Канал @{channel_username} не существует")
             else:
-                print(f"        ❌ Ошибка: {error_msg[:100]}")
+                print(f"        ❌ Ошибка: {str(e)[:100]}")
     
     async def run(self):
         """Запускает парсинг всех каналов"""
         print("  📡 Подключаемся к Telegram API...")
         
         try:
-            # Подключаемся с существующей сессией
             await self.client.connect()
             
-            # Проверяем, авторизованы ли мы
             if not await self.client.is_user_authorized():
-                print("    ❌ Ошибка: нет авторизации. Файл сессии не работает")
+                print("    ❌ Ошибка: нет авторизации")
                 return
             else:
-                print("    ✅ Уже авторизованы (через файл сессии)")
+                print("    ✅ Уже авторизованы")
             
             print(f"\n  🔍 Начинаем парсинг {len(TARGET_CHANNELS)} каналов...")
             print(f"  📊 Текущая история: {len(self.rate_history.history)} банков")
             
-            # Парсим каждый канал
             for channel in TARGET_CHANNELS:
                 await self.parse_channel(channel)
                 await asyncio.sleep(1.5)
             
-            # Сохраняем обновлённую историю
-            self.rate_history.save()
+            # Определяем изменения
+            changes = self.rate_history.detect_changes()
+            
+            # Сохраняем обновлённые данные
+            self.rate_history.save_state()
             
             print(f"\n  📊 Найдено новых минимальных ставок: {self.new_finds}")
             print(f"  📊 Всего в истории: {len(self.rate_history.history)} банков")
+            print(f"  📊 Изменений с прошлого раза: {len(changes)}")
             
-            # Отключаемся
             await self.client.disconnect()
+            
+            return changes
             
         except Exception as e:
             print(f"    ❌ Критическая ошибка: {e}")
+            return {}
 
-def format_message(rate_history):
+def format_changes(changes):
+    """Форматирует список изменений для отображения"""
+    if not changes:
+        return ""
+    
+    text = "\n📊 <b>Изменения за сутки:</b>\n"
+    
+    for bank, data in changes.items():
+        if data['type'] == 'new':
+            text += f"➕ {bank}: <b>{data['new']}%</b> (новый банк)\n"
+        elif data['type'] == 'changed':
+            old = data['old']
+            new = data['new']
+            if new < old:
+                text += f"📉 {bank}: {old}% → <b>{new}%</b> (снижение)\n"
+            else:
+                text += f"📈 {bank}: {old}% → <b>{new}%</b> (повышение)\n"
+    
+    return text
+
+def format_message(rate_history, changes):
     """Формирует сообщение для канала"""
     final_rates = rate_history.get_final_rates()
     
@@ -282,16 +329,17 @@ def format_message(rate_history):
         else:
             text += f"• {bank} — {rate}%\n"
     
+    # Добавляем блок с изменениями
+    text += format_changes(changes)
+    
     # Добавляем статистику
     history_count = len(rate_history.history)
-    source_text = f"история ({history_count} банков)" if history_count > 0 else "начальные данные"
     
     text += f"""
 
 📅 {datetime.now().strftime('%d.%m.%Y %H:%M')} (МСК)
 📊 Всего банков: {len(rates_list)}
 🤖 В истории: {history_count}
-🔄 Источник: {source_text}
 """
     
     return text
@@ -319,38 +367,30 @@ def send_to_channel(text):
 
 def main():
     print("=" * 60)
-    print("🚀 ИПОТЕЧНЫЙ БОТ - АВТОМАТИЧЕСКИЙ СБОРНИК")
+    print("🚀 ИПОТЕЧНЫЙ БОТ - С ОТОБРАЖЕНИЕМ ИЗМЕНЕНИЙ")
     print(f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
     print("=" * 60)
     
-    # Проверяем наличие необходимых переменных
-    if not BOT_TOKEN:
-        print("❌ Ошибка: не задан BOT_TOKEN")
+    if not BOT_TOKEN or not CHANNEL_ID:
+        print("❌ Ошибка: не заданы токены")
         return
-    
-    if not CHANNEL_ID:
-        print("❌ Ошибка: не задан CHANNEL_ID")
-        return
-    
-    print(f"📢 Канал: {CHANNEL_ID}")
     
     # Создаём и запускаем парсер
     parser = TelegramParser()
     
-    # Запускаем асинхронную функцию
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
     try:
-        loop.run_until_complete(parser.run())
+        changes = loop.run_until_complete(parser.run())
         
         # Формируем и отправляем сообщение
-        message = format_message(parser.rate_history)
+        message = format_message(parser.rate_history, changes)
         send_to_channel(message)
         
         print("\n✅ ГОТОВО")
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e}")
+        print(f"\n❌ Ошибка: {e}")
     finally:
         loop.close()
 
